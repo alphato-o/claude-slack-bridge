@@ -202,7 +202,7 @@ class TestChatUpdateReporter:
 # ---------- NativeStreamReporter lifecycle ----------
 
 class TestNativeStreamReporter:
-    def test_streams_text_and_tool_updates(self):
+    def test_streams_text_and_tool_widgets(self):
         client = FakeAsyncClient()
         rep = NativeStreamReporter(
             client, "C1", "100.0", recipient_user_id="U1", recipient_team_id="T1")
@@ -210,17 +210,51 @@ class TestNativeStreamReporter:
         async def go():
             await rep.start()
             await rep.on_event(_assistant(
-                {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}))
+                {"type": "tool_use", "id": "tool_1", "name": "Bash", "input": {"command": "ls"}}))
+            # tool_result flips the same task id to complete
+            await rep.on_event({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "tool_1", "content": "a\nb"}]}})
             await rep.on_event(_assistant({"type": "text", "text": "All done."}))
             await rep.finish("All done.")
 
         asyncio.run(go())
-        assert client.named("startStream")
         starts = client.named("startStream")[0]
         assert starts["recipient_user_id"] == "U1" and starts["recipient_team_id"] == "T1"
         appends = client.named("appendStream")
-        assert any("task_update" in a for a in appends)
+        # text streamed as markdown_text
         assert any("markdown_text" in a for a in appends)
+        # tool rendered as a task_update chunk, then completed
+        chunks = [a["chunks"][0] for a in appends if "chunks" in a]
+        assert any(c["type"] == "task_update" and c["status"] == "in_progress" for c in chunks)
+        assert any(c["type"] == "task_update" and c["status"] == "complete"
+                   and c["id"] == "tool_1" for c in chunks)
+        assert client.named("stopStream")
+
+    def test_tool_result_error_marks_task_error(self):
+        client = FakeAsyncClient()
+        rep = NativeStreamReporter(client, "C1", "100.0")
+
+        async def go():
+            await rep.start()
+            await rep.on_event(_assistant(
+                {"type": "tool_use", "id": "t9", "name": "Bash", "input": {"command": "boom"}}))
+            await rep.on_event({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t9", "content": "nope", "is_error": True}]}})
+            await rep.finish("done")
+
+        asyncio.run(go())
+        chunks = [a["chunks"][0] for a in client.named("appendStream") if "chunks" in a]
+        assert any(c["id"] == "t9" and c["status"] == "error" for c in chunks)
+
+    def test_abort_stops_stream(self):
+        client = FakeAsyncClient()
+        rep = NativeStreamReporter(client, "C1", "100.0")
+
+        async def go():
+            await rep.start()
+            await rep._abort()
+
+        asyncio.run(go())
         assert client.named("stopStream")
 
 

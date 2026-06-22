@@ -363,6 +363,11 @@ class ProgressReporter:
     # last_paint defaults to 0 so the first _maybe_paint always flushes.
     _last_paint: float = 0.0
 
+    async def _abort(self) -> None:
+        """Tear down an abandoned reporter without posting a final answer.
+        Overridden by streaming backends that must close their open stream."""
+        return
+
     # -- transport hooks (subclasses implement) --------------------------
     async def _open(self) -> None: ...
     async def _paint(self) -> None: ...
@@ -435,6 +440,10 @@ class NativeStreamReporter(ProgressReporter):
         self._team_id = recipient_team_id
         self._stream_ts: str | None = None
         self._text_started = False
+        # tool_use id → title, so a tool_result can flip the same task widget
+        # from in_progress to complete/error.
+        self._titles: dict[str, str] = {}
+        self._think_n = 0
 
     async def _open(self) -> None:
         kwargs: dict[str, Any] = dict(channel=self._channel, thread_ts=self._thread_ts)
@@ -445,52 +454,91 @@ class NativeStreamReporter(ProgressReporter):
         self._stream_ts = resp["ts"]
 
     async def on_event(self, event: dict[str, Any]) -> None:
-        # Native mode streams assistant *text* inline and tool calls as
-        # task_update chunks, so it overrides the base accumulation to append
-        # to the live stream immediately rather than repainting a whole message.
+        # Native mode streams assistant *text* into the message body and renders
+        # tools/thinking as task_update chunks (separate widgets), so it fully
+        # overrides the base accumulation. Any API error bubbles to the
+        # FallbackReporter, which stops this stream and switches to chat.update.
         if self._closed:
             return
-        if event.get("type") == "result":
+        etype = event.get("type")
+        if etype == "result":
             self._result_event = event
             return
+
+        if etype == "user":  # tool_result(s) — complete/fail the matching task
+            for block in event.get("message", {}).get("content", []) or []:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tid = block.get("tool_use_id", "")
+                content = block.get("content", "")
+                if isinstance(content, list):
+                    content = "".join(c.get("text", "") for c in content if isinstance(c, dict))
+                chunk = {
+                    "type": "task_update",
+                    "id": tid or f"r{len(self._titles)}",
+                    "title": _first_line(self._titles.get(tid, "tool"), 256),
+                    "status": "error" if block.get("is_error") else "complete",
+                }
+                if self._renderer.verbosity == "rich" and str(content).strip():
+                    chunk["details"] = _first_line(str(content), 256)
+                await self._append_chunk(chunk)
+            return
+
         for block in _assistant_blocks(event):
             bt = block.get("type")
-            try:
-                if bt == "text" and block.get("text", "").strip():
-                    await self._append(markdown_text=block["text"])
-                    self._text_started = True
-                elif bt == "tool_use":
-                    line = self._renderer.tool_line(block.get("name", ""), block.get("input", {}))
-                    await self._append(task_update=_first_line(line, 256))
-                elif bt == "thinking" and self._renderer.verbosity == "rich":
-                    tl = self._renderer.thinking_line(block.get("thinking", ""))
-                    if tl:
-                        await self._append(task_update=_first_line(tl, 256))
-            except Exception:
-                raise  # bubble to factory for fallback
+            if bt == "text" and block.get("text", "").strip():
+                await self._append_text(block["text"])
+                self._text_started = True
+            elif bt == "tool_use":
+                tid = block.get("id", "") or f"t{len(self._titles)}"
+                title = self._renderer.tool_line(block.get("name", ""), block.get("input", {}))
+                self._titles[tid] = title
+                await self._append_chunk({
+                    "type": "task_update", "id": tid,
+                    "title": _first_line(title, 256), "status": "in_progress",
+                })
+            elif bt == "thinking" and self._renderer.verbosity == "rich":
+                tl = self._renderer.thinking_line(block.get("thinking", ""))
+                if tl:
+                    self._think_n += 1
+                    await self._append_chunk({
+                        "type": "task_update", "id": f"think-{self._think_n}",
+                        "title": _first_line(tl, 256), "status": "complete",
+                    })
 
-    async def _append(self, *, markdown_text: str | None = None, task_update: str | None = None) -> None:
-        if not self._stream_ts:
-            return
-        kwargs: dict[str, Any] = dict(channel=self._channel, ts=self._stream_ts)
-        if markdown_text is not None:
-            kwargs["markdown_text"] = markdown_text
-        if task_update is not None:
-            kwargs["task_update"] = task_update
-        await self._client.chat_appendStream(**kwargs)
+    async def _append_text(self, text: str) -> None:
+        if self._stream_ts:
+            await self._client.chat_appendStream(
+                channel=self._channel, ts=self._stream_ts, markdown_text=text)
+
+    async def _append_chunk(self, chunk: dict[str, Any]) -> None:
+        if self._stream_ts:
+            await self._client.chat_appendStream(
+                channel=self._channel, ts=self._stream_ts, chunks=[chunk])
 
     async def _paint(self) -> None:
-        # Streaming is push-based via on_event; the heartbeat only needs to keep
-        # the native status alive, which the base _flush handles.
+        # Streaming is push-based via on_event; nothing for the heartbeat to do.
         return
 
     async def _close(self, final_text: str) -> None:
-        # If the model produced no streamed text (e.g. tools-only turn), make
-        # sure the final answer still lands in the stream before stopping.
-        if not self._text_started and final_text.strip() and self._stream_ts:
-            await self._append(markdown_text=final_text)
+        # Tools-only turn (no streamed text): make sure the answer still lands.
+        if not self._text_started and final_text.strip():
+            await self._append_text(final_text)
+        footer = self._renderer.footer(self._result_event, self.elapsed)
+        if footer:
+            await self._append_text(f"\n\n_{footer}_")
         if self._stream_ts:
             await self._client.chat_stopStream(channel=self._channel, ts=self._stream_ts)
+
+    async def _abort(self) -> None:
+        """Best-effort close of an abandoned stream (used on fallback) so Slack
+        doesn't leave the message stuck in the 'streaming' state."""
+        if self._stream_ts:
+            try:
+                await self._client.chat_stopStream(channel=self._channel, ts=self._stream_ts)
+            except Exception:
+                pass
+            self._stream_ts = None
 
 
 def _assistant_blocks(event: dict[str, Any]) -> list[dict[str, Any]]:
@@ -552,6 +600,7 @@ class FallbackReporter(ProgressReporter):
         logger.info("native streaming failed — falling back to chat.update for this run")
         try:
             await self._inner._shutdown()
+            await self._inner._abort()  # stop the stuck stream message
         except Exception:
             pass
         self._inner = self._build_fallback()
