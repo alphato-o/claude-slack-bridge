@@ -23,11 +23,11 @@ from slack_bolt.async_app import AsyncApp
 
 from claude_handler import ClaudeHandler
 from security import AccessControl, SecurityConfig
+from slack_progress import make_reporter
 
 logger = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/slack-bridge.sock"
-SLACK_MAX_MESSAGE_LENGTH = 40000
 
 
 class SlackDaemon:
@@ -99,7 +99,7 @@ class SlackDaemon:
         if thread_ts:
             if thread_ts in self._active_threads:
                 return
-            asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text))
+            asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text, user_id))
             return
 
         # Case 3: Top-level message — only respond if the bot is mentioned.
@@ -113,7 +113,7 @@ class SlackDaemon:
         message_ts: str = event.get("ts", "")
         if message_ts in self._active_threads:
             return
-        asyncio.create_task(self._handle_claude_new_message(channel, message_ts, text))
+        asyncio.create_task(self._handle_claude_new_message(channel, message_ts, text, user_id))
 
     async def _handle_app_mention(self, event: dict[str, Any]) -> None:
         """Handle app_mention events (bot @mentioned in any channel)."""
@@ -135,41 +135,44 @@ class SlackDaemon:
         # Delegate to the normal message handler for authorized mentions.
         await self._handle_slack_message(event)
 
-    async def _handle_claude_new_message(self, channel: str, message_ts: str, text: str) -> None:
-        """Spawn Claude for a new top-level message and post the response as a thread reply."""
+    def _make_reporter(self, channel: str, thread_ts: str, user_id: str) -> Any:
+        """Build a live-progress reporter for one Flow-B run (see slack_progress)."""
+        return make_reporter(
+            self._app.client, channel, thread_ts,
+            user_id=user_id, team_id=self._claude._team_id,
+        )
+
+    async def _handle_claude_new_message(
+        self, channel: str, message_ts: str, text: str, user_id: str = ""
+    ) -> None:
+        """Spawn Claude for a new top-level message and stream progress to the thread."""
         self._active_threads.add(message_ts)
+        reporter = self._make_reporter(channel, message_ts, user_id)
         try:
-            response = await self._claude.handle_message(channel, message_ts, text)
-            await self._post_response(channel, message_ts, response)
+            await reporter.start()
+            response = await self._claude.handle_message(channel, message_ts, text, reporter)
+            await reporter.finish(response)
         except Exception as exc:
             logger.error("Error handling top-level message %s: %s", message_ts, exc)
+            await reporter.fail("Sorry, I encountered an error processing your request.")
         finally:
             self._active_threads.discard(message_ts)
 
-    async def _handle_claude_thread_reply(self, channel: str, thread_ts: str, text: str) -> None:
-        """Spawn Claude for a thread reply and post the response."""
+    async def _handle_claude_thread_reply(
+        self, channel: str, thread_ts: str, text: str, user_id: str = ""
+    ) -> None:
+        """Spawn Claude for a thread reply and stream progress to the thread."""
         self._active_threads.add(thread_ts)
+        reporter = self._make_reporter(channel, thread_ts, user_id)
         try:
-            response = await self._claude.handle_thread_reply(channel, thread_ts, text)
-            await self._post_response(channel, thread_ts, response)
+            await reporter.start()
+            response = await self._claude.handle_thread_reply(channel, thread_ts, text, reporter)
+            await reporter.finish(response)
         except Exception as exc:
             logger.error("Error in thread continuation %s: %s", thread_ts, exc)
+            await reporter.fail("Sorry, I encountered an error processing your request.")
         finally:
             self._active_threads.discard(thread_ts)
-
-    async def _post_response(self, channel: str, thread_ts: str, text: str) -> None:
-        """Post a response to Slack, splitting if it exceeds the message length limit."""
-        if len(text) <= SLACK_MAX_MESSAGE_LENGTH:
-            await self._app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=text, mrkdwn=True,
-            )
-            return
-
-        for i in range(0, len(text), SLACK_MAX_MESSAGE_LENGTH):
-            chunk = text[i : i + SLACK_MAX_MESSAGE_LENGTH]
-            await self._app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=chunk, mrkdwn=True,
-            )
 
     async def _handle_session_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

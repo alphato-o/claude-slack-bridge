@@ -117,6 +117,7 @@ class ClaudeHandler:
     def __init__(self, slack_client: Any) -> None:
         self._slack_client = slack_client
         self._bot_user_id: str = ""
+        self._team_id: str = ""
         self._sessions: dict[str, str] = {}  # thread_ts → session UUID
         self._project_map: dict[str, Any] = _load_project_map()
         # Resolved at startup: channel ID → {"path": str|None, "plugin_dir": str|None,
@@ -130,6 +131,7 @@ class ClaudeHandler:
         """Cache the bot's own user ID and resolve channel names to IDs."""
         resp = await self._slack_client.auth_test()
         self._bot_user_id = resp["user_id"]
+        self._team_id = resp.get("team_id", "")
         logger.info("ClaudeHandler initialized, bot_user_id=%s", self._bot_user_id)
 
         if self._project_map:
@@ -139,7 +141,9 @@ class ClaudeHandler:
     # Public API
     # ------------------------------------------------------------------
 
-    async def handle_message(self, channel: str, message_ts: str, text: str) -> str:
+    async def handle_message(
+        self, channel: str, message_ts: str, text: str, reporter: Any = None
+    ) -> str:
         """Handle a new top-level Slack message (start a new Claude session)."""
         label, text = _parse_worktree_tag(text)
         project_dir, plugin_dir = self._get_project_config(channel, label)
@@ -150,9 +154,11 @@ class ClaudeHandler:
         logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
         cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
-        return await self._run_claude(cmd, text, cwd=project_dir)
+        return await self._run_claude(cmd, text, cwd=project_dir, reporter=reporter)
 
-    async def handle_thread_reply(self, channel: str, thread_ts: str, text: str) -> str:
+    async def handle_thread_reply(
+        self, channel: str, thread_ts: str, text: str, reporter: Any = None
+    ) -> str:
         """Handle a threaded reply (resume existing session or fallback)."""
         session_id = self._sessions.get(thread_ts)
         # Thread inherits the worktree chosen at start; re-tagging mid-thread
@@ -163,13 +169,13 @@ class ClaudeHandler:
         if session_id:
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
             cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir)
-            return await self._run_claude(cmd, text, cwd=project_dir)
+            return await self._run_claude(cmd, text, cwd=project_dir, reporter=reporter)
 
         # Fallback: session lost (container restart) — use thread history as context.
         logger.info("No session for thread %s, falling back to thread history.", thread_ts)
         prompt = await self._build_thread_prompt(channel, thread_ts)
         cmd = self._build_cmd(plugin_dir=plugin_dir)
-        return await self._run_claude(cmd, prompt, cwd=project_dir)
+        return await self._run_claude(cmd, prompt, cwd=project_dir, reporter=reporter)
 
     # ------------------------------------------------------------------
     # Internals
@@ -306,8 +312,16 @@ class ClaudeHandler:
             cmd.extend(["--resume", resume])
         return cmd
 
-    async def _run_claude(self, cmd: list[str], prompt: str, cwd: str | None = None) -> str:
-        """Spawn a ``claude -p`` subprocess, stream-log its events, and return the final reply."""
+    async def _run_claude(
+        self, cmd: list[str], prompt: str, cwd: str | None = None, reporter: Any = None
+    ) -> str:
+        """Spawn a ``claude -p`` subprocess, stream-log its events, and return the final reply.
+
+        When *reporter* is provided, every parsed stream-json event is also
+        forwarded to it (``reporter.on_event``) so the run's progress is
+        surfaced live to Slack. Reporter errors are swallowed — a flaky progress
+        update must never break the actual Claude run.
+        """
         env = os.environ.copy()
         # Strip tokens that must never be reachable by the Claude subprocess.
         # A prompt-injection attack could otherwise instruct Claude to exfiltrate them.
@@ -351,6 +365,11 @@ class ClaudeHandler:
                     logger.debug("claude stdout (non-json): %s", line[:1000])
                     continue
                 self._log_stream_event(event)
+                if reporter is not None and isinstance(event, dict):
+                    try:
+                        await reporter.on_event(event)
+                    except Exception as exc:
+                        logger.debug("reporter.on_event failed (ignored): %s", exc)
                 if (
                     isinstance(event, dict)
                     and event.get("type") == "result"
