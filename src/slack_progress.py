@@ -507,9 +507,11 @@ class NativeStreamReporter(ProgressReporter):
                     })
 
     async def _append_text(self, text: str) -> None:
-        if self._stream_ts:
-            await self._client.chat_appendStream(
-                channel=self._channel, ts=self._stream_ts, markdown_text=text)
+        # Text is sent as a markdown_text *chunk*, not the top-level markdown_text
+        # param: a stream locks to one mode on its first append, and mixing
+        # top-level markdown_text with chunks raises streaming_mode_mismatch.
+        # Routing everything through chunks lets text and task widgets coexist.
+        await self._append_chunk({"type": "markdown_text", "text": text})
 
     async def _append_chunk(self, chunk: dict[str, Any]) -> None:
         if self._stream_ts:

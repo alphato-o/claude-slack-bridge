@@ -221,10 +221,14 @@ class TestNativeStreamReporter:
         starts = client.named("startStream")[0]
         assert starts["recipient_user_id"] == "U1" and starts["recipient_team_id"] == "T1"
         appends = client.named("appendStream")
-        # text streamed as markdown_text
-        assert any("markdown_text" in a for a in appends)
-        # tool rendered as a task_update chunk, then completed
+        # EVERYTHING goes through chunks (mixing top-level markdown_text with
+        # chunks triggers streaming_mode_mismatch), so no append uses the
+        # top-level markdown_text param.
+        assert all("markdown_text" not in a for a in appends)
         chunks = [a["chunks"][0] for a in appends if "chunks" in a]
+        # text streamed as a markdown_text chunk
+        assert any(c["type"] == "markdown_text" for c in chunks)
+        # tool rendered as a task_update chunk, then completed
         assert any(c["type"] == "task_update" and c["status"] == "in_progress" for c in chunks)
         assert any(c["type"] == "task_update" and c["status"] == "complete"
                    and c["id"] == "tool_1" for c in chunks)
