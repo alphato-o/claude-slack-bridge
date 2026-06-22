@@ -265,6 +265,82 @@ class TestNativeStreamReporter:
         asyncio.run(go())
         assert client.named("stopStream")
 
+    def test_todowrite_renders_live_plan(self):
+        client = FakeAsyncClient()
+        rep = NativeStreamReporter(client, "C1", "100.0")
+
+        def todos(*statuses):
+            return {"todos": [{"content": f"step {i}", "status": s}
+                              for i, s in enumerate(statuses)]}
+
+        async def go():
+            await rep.start()
+            await rep.on_event(_assistant(
+                {"type": "tool_use", "id": "tw1", "name": "TodoWrite",
+                 "input": todos("completed", "in_progress", "pending")}))
+            # second call updates the SAME widgets (same todo-* ids), no new banner
+            await rep.on_event(_assistant(
+                {"type": "tool_use", "id": "tw2", "name": "TodoWrite",
+                 "input": todos("completed", "completed", "in_progress")}))
+            await rep.finish("done")
+
+        asyncio.run(go())
+        all_chunks = [c for a in client.named("appendStream") if "chunks" in a for c in a["chunks"]]
+        # exactly one plan banner across both TodoWrite calls
+        assert sum(1 for c in all_chunks if c["type"] == "plan_update") == 1
+        # todo-1 goes in_progress (call 1) then complete (call 2) — same stable id
+        todo1 = [c for c in all_chunks if c.get("id") == "todo-1"]
+        assert any(c["status"] == "in_progress" for c in todo1)
+        assert any(c["status"] == "complete" for c in todo1)
+        # the TodoWrite tool_use itself is not rendered as a generic task widget
+        assert all(c.get("id") not in ("tw1", "tw2") for c in all_chunks)
+
+    def test_taskfamily_renders_live_plan(self):
+        client = FakeAsyncClient()
+        rep = NativeStreamReporter(client, "C1", "100.0")
+
+        async def go():
+            await rep.start()
+            # TaskCreate: the id is only known once the result comes back
+            await rep.on_event(_assistant(
+                {"type": "tool_use", "id": "u1", "name": "TaskCreate", "input": {"subject": "Build X"}}))
+            await rep.on_event({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "u1",
+                 "content": "Task #1 created successfully: Build X"}]}})
+            # TaskUpdate flips the same widget in_progress → completed
+            await rep.on_event(_assistant(
+                {"type": "tool_use", "id": "u2", "name": "TaskUpdate",
+                 "input": {"taskId": "1", "status": "in_progress"}}))
+            await rep.on_event(_assistant(
+                {"type": "tool_use", "id": "u3", "name": "TaskUpdate",
+                 "input": {"taskId": "1", "status": "completed"}}))
+            await rep.finish("done")
+
+        asyncio.run(go())
+        all_chunks = [c for a in client.named("appendStream") if "chunks" in a for c in a["chunks"]]
+        assert sum(1 for c in all_chunks if c["type"] == "plan_update") == 1
+        task1 = [c for c in all_chunks if c.get("id") == "task-1"]
+        assert any(c["status"] == "pending" for c in task1)
+        assert any(c["status"] == "in_progress" for c in task1)
+        assert any(c["status"] == "complete" for c in task1)
+        assert all(c["title"] == "Build X" for c in task1)  # subject carried across updates
+        # raw TaskCreate/TaskUpdate tool_use ids are not generic widgets
+        assert all(c.get("id") not in ("u1", "u2", "u3") for c in all_chunks)
+
+    def test_tool_result_without_widget_is_skipped(self):
+        client = FakeAsyncClient()
+        rep = NativeStreamReporter(client, "C1", "100.0")
+
+        async def go():
+            await rep.start()
+            await rep.on_event({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "ghost", "content": "x"}]}})
+            await rep.finish("done")
+
+        asyncio.run(go())
+        all_chunks = [c for a in client.named("appendStream") if "chunks" in a for c in a["chunks"]]
+        assert all(c.get("id") != "ghost" for c in all_chunks)
+
 
 # ---------- factory ----------
 

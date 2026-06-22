@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -70,7 +71,13 @@ _TOOL_EMOJI = {
     "read": "📖", "edit": "✏️", "multiedit": "✏️", "write": "📝",
     "bash": "⚡", "grep": "🔍", "glob": "🔍", "task": "🤖",
     "webfetch": "🌐", "websearch": "🌐", "todowrite": "📋",
-    "notebookedit": "✏️",
+    "notebookedit": "✏️", "taskcreate": "📋", "taskupdate": "📋",
+}
+
+# Planning-tool status → Slack streaming task_update status.
+_TASK_STATUS = {
+    "pending": "pending", "in_progress": "in_progress",
+    "completed": "complete", "deleted": "complete",
 }
 
 
@@ -132,6 +139,12 @@ class ActivityRenderer:
             done = sum(1 for t in todos if isinstance(t, dict) and t.get("status") == "completed")
             head = f"{emoji} Plan: {len(todos)} steps ({done} done)"
             return f"{head} — now: {_first_line(current, 80)}" if current else head
+        if key == "taskcreate":
+            return f"{emoji} Plan: {_first_line(ti.get('subject', 'task'), 80)}"
+        if key == "taskupdate":
+            status = (ti.get("status") or "").replace("_", " ")
+            label = ti.get("subject") or f"task {ti.get('taskId', '')}"
+            return f"{emoji} {_first_line(label, 70)}" + (f" — {status}" if status else "")
         if key.startswith("mcp__"):
             pretty = key.split("__", 2)[-1].replace("_", " ")
             return f"{emoji} {pretty}"
@@ -350,6 +363,13 @@ class ProgressReporter:
                 await self._heartbeat
             except (asyncio.CancelledError, Exception):
                 pass
+        # Clear the animated composer status so it doesn't linger after the run.
+        if self._set_status:
+            try:
+                await self._client.assistant_threads_setStatus(
+                    channel_id=self._channel, thread_ts=self._thread_ts, status="")
+            except Exception:  # pragma: no cover - network/feature-gated
+                pass
 
     async def _push_status(self) -> None:
         """Best-effort native 'thinking…' status (Tier 2). No-op on failure."""
@@ -450,6 +470,12 @@ class NativeStreamReporter(ProgressReporter):
         # from in_progress to complete/error.
         self._titles: dict[str, str] = {}
         self._think_n = 0
+        self._plan_started = False
+        # Task* plan tracking: tool_use id of a TaskCreate → its subject (the id
+        # the system assigns only comes back in the tool_result), and taskId →
+        # subject so a TaskUpdate can re-label the same widget.
+        self._taskcreate_uses: dict[str, str] = {}
+        self._task_titles: dict[str, str] = {}
 
     async def _open(self) -> None:
         kwargs: dict[str, Any] = dict(channel=self._channel, thread_ts=self._thread_ts)
@@ -472,6 +498,7 @@ class NativeStreamReporter(ProgressReporter):
             return
 
         if etype == "user":  # tool_result(s) — complete/fail the matching task
+            chunks: list[dict[str, Any]] = []
             for block in event.get("message", {}).get("content", []) or []:
                 if not isinstance(block, dict) or block.get("type") != "tool_result":
                     continue
@@ -479,50 +506,128 @@ class NativeStreamReporter(ProgressReporter):
                 content = block.get("content", "")
                 if isinstance(content, list):
                     content = "".join(c.get("text", "") for c in content if isinstance(c, dict))
+                # A TaskCreate result reveals the system-assigned task id ("Task #N
+                # created…"); register the plan widget now that we know the id.
+                if tid in self._taskcreate_uses:
+                    subj = self._taskcreate_uses.pop(tid)
+                    m = re.search(r"#(\d+)", str(content))
+                    if m:
+                        n = m.group(1)
+                        self._task_titles[n] = subj
+                        chunks.extend(self._plan_banner())
+                        chunks.append({"type": "task_update", "id": f"task-{n}",
+                                       "title": _first_line(subj, 256), "status": "pending"})
+                    continue
+                # Only complete tasks we opened with an in_progress widget.
+                if tid not in self._titles:
+                    continue
                 chunk = {
-                    "type": "task_update",
-                    "id": tid or f"r{len(self._titles)}",
-                    "title": _first_line(self._titles.get(tid, "tool"), 256),
+                    "type": "task_update", "id": tid,
+                    "title": _first_line(self._titles[tid], 256),
                     "status": "error" if block.get("is_error") else "complete",
                 }
                 if self._renderer.verbosity == "rich" and str(content).strip():
                     chunk["details"] = _first_line(str(content), 256)
-                await self._append_chunk(chunk)
+                chunks.append(chunk)
+            await self._append_chunks(chunks)
             return
 
+        # Assistant event: build one ordered chunk list and send in a single
+        # append (fewer API calls → easier on the streaming rate limit).
+        chunks = []
         for block in _assistant_blocks(event):
             bt = block.get("type")
             if bt == "text" and block.get("text", "").strip():
-                await self._append_text(block["text"])
+                chunks.append({"type": "markdown_text", "text": block["text"]})
                 self._text_started = True
+                self._status = "✍️ Writing response…"
             elif bt == "tool_use":
-                tid = block.get("id", "") or f"t{len(self._titles)}"
-                title = self._renderer.tool_line(block.get("name", ""), block.get("input", {}))
-                self._titles[tid] = title
-                await self._append_chunk({
-                    "type": "task_update", "id": tid,
-                    "title": _first_line(title, 256), "status": "in_progress",
-                })
+                chunks.extend(self._tool_use_chunks(block))
             elif bt == "thinking" and self._renderer.verbosity == "rich":
                 tl = self._renderer.thinking_line(block.get("thinking", ""))
                 if tl:
                     self._think_n += 1
-                    await self._append_chunk({
+                    self._status = "🤔 Thinking…"
+                    chunks.append({
                         "type": "task_update", "id": f"think-{self._think_n}",
                         "title": _first_line(tl, 256), "status": "complete",
                     })
+        await self._append_chunks(chunks)
+
+    def _tool_use_chunks(self, block: dict[str, Any]) -> list[dict[str, Any]]:
+        """Map one tool_use block to stream chunks. The Task*/TodoWrite planning
+        tools become a live plan (a plan_update banner + per-task widgets); every
+        other tool becomes a single in_progress task widget keyed by tool_use id.
+        """
+        name = (block.get("name") or "")
+        nl = name.lower()
+        tin = block.get("input", {}) if isinstance(block.get("input"), dict) else {}
+
+        if nl == "todowrite":  # snapshot-style plan (other Claude builds)
+            self._status = "📋 Updating plan…"
+            return self._plan_chunks(tin)
+
+        if nl == "taskcreate":  # id is assigned in the result, so widget waits
+            subj = tin.get("subject") or "task"
+            self._taskcreate_uses[block.get("id", "")] = subj
+            self._status = f"📋 Planning: {_first_line(subj, 60)}"
+            return []
+
+        if nl == "taskupdate":  # flip the matching plan widget's status
+            n = str(tin.get("taskId") or "")
+            if not n:
+                return []
+            if tin.get("subject"):
+                self._task_titles[n] = tin["subject"]
+            title = self._task_titles.get(n, f"Task {n}")
+            status = _TASK_STATUS.get(tin.get("status", ""), "in_progress")
+            self._status = f"📋 {_first_line(title, 60)}"
+            return self._plan_banner() + [{
+                "type": "task_update", "id": f"task-{n}",
+                "title": _first_line(title, 256), "status": status,
+            }]
+
+        # Generic tool — one in_progress widget, completed by its tool_result.
+        tid = block.get("id", "") or f"t{len(self._titles)}"
+        title = self._renderer.tool_line(name, tin)
+        self._titles[tid] = title
+        self._status = title  # feed the composer status (setStatus)
+        return [{"type": "task_update", "id": tid,
+                 "title": _first_line(title, 256), "status": "in_progress"}]
+
+    def _plan_banner(self) -> list[dict[str, Any]]:
+        """The one-time '📋 Plan' header chunk (empty after the first call)."""
+        if self._plan_started:
+            return []
+        self._plan_started = True
+        return [{"type": "plan_update", "title": "📋 Plan"}]
+
+    def _plan_chunks(self, tool_input: dict[str, Any]) -> list[dict[str, Any]]:
+        """Render a TodoWrite snapshot as a plan banner + one task_update per todo,
+        keyed by index so later TodoWrite calls update the same widgets."""
+        todos = tool_input.get("todos") or []
+        out = self._plan_banner()
+        for i, t in enumerate(todos):
+            if not isinstance(t, dict):
+                continue
+            out.append({
+                "type": "task_update", "id": f"todo-{i}",
+                "title": _first_line(t.get("content", ""), 256),
+                "status": _TASK_STATUS.get(t.get("status", ""), "pending"),
+            })
+        return out
 
     async def _append_text(self, text: str) -> None:
         # Text is sent as a markdown_text *chunk*, not the top-level markdown_text
         # param: a stream locks to one mode on its first append, and mixing
         # top-level markdown_text with chunks raises streaming_mode_mismatch.
         # Routing everything through chunks lets text and task widgets coexist.
-        await self._append_chunk({"type": "markdown_text", "text": text})
+        await self._append_chunks([{"type": "markdown_text", "text": text}])
 
-    async def _append_chunk(self, chunk: dict[str, Any]) -> None:
-        if self._stream_ts:
+    async def _append_chunks(self, chunks: list[dict[str, Any]]) -> None:
+        if self._stream_ts and chunks:
             await self._client.chat_appendStream(
-                channel=self._channel, ts=self._stream_ts, chunks=[chunk])
+                channel=self._channel, ts=self._stream_ts, chunks=chunks)
 
     async def _paint(self) -> None:
         # Streaming is push-based via on_event; nothing for the heartbeat to do.
