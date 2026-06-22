@@ -1,5 +1,10 @@
 fastmcp
-slack-bolt[async]
+# slack-sdk >= 3.42 is required for the live-progress feature: chat.startStream/
+# appendStream/stopStream (native streaming) and the markdown_text param (so Slack
+# renders Claude's markdown instead of showing it raw). slack-bolt pulls slack-sdk
+# transitively; pin both so a rebuild can't silently drop to a version without them.
+slack-bolt[async]>=1.28.0
+slack-sdk>=3.42.0
 aiohttp
 pydantic-settings
 pytest>=7

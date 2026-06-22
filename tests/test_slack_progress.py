@@ -180,7 +180,11 @@ class TestChatUpdateReporter:
             await rep.finish("Here is the answer.")
 
         self._run(go())
-        final = client.named("update")[-1]["text"]
+        # Final answer goes via markdown_text (Slack renders Claude's markdown),
+        # not the mrkdwn `text` param.
+        update = client.named("update")[-1]
+        assert "text" not in update
+        final = update["markdown_text"]
         assert "Here is the answer." in final
         assert "3 turns" in final and "~2k tokens" in final
 
@@ -275,7 +279,7 @@ class TestFactory:
             await rep.finish("answer")
 
         asyncio.run(go())
-        assert client.named("postMessage")[-1]["text"] == "answer"
+        assert client.named("postMessage")[-1]["markdown_text"] == "answer"
         assert not client.named("update")  # no live edits in off mode
 
     def test_mode_selection(self):

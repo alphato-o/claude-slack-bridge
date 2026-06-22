@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 # Slack hard limits.
 SLACK_MAX_MESSAGE_LENGTH = 40000
+# The markdown_text param (Slack renders real markdown) caps at 12k chars, lower
+# than the 40k for plain text — so final answers posted via markdown_text split here.
+MARKDOWN_TEXT_MAX = 12000
 # chat.update is Tier 3 (~50/min). Editing one message faster than ~1/sec is
 # both wasteful and risks message_update_rate_limited, so coalesce updates to
 # at most one per this interval. A background heartbeat flushes pending state.
@@ -402,19 +405,22 @@ class ChatUpdateReporter(ProgressReporter):
         )
 
     async def _close(self, final_text: str) -> None:
+        # The final answer is Claude's own markdown, so post it via markdown_text
+        # (Slack renders **bold**, headers, [links](url), lists…) rather than the
+        # mrkdwn `text` param, which would show those raw. Split at the 12k cap.
         body = self._compose_final(final_text)
-        head, *rest = _split_message(body)
+        head, *rest = _split_message(body, MARKDOWN_TEXT_MAX)
         if self._msg_ts:
             await self._client.chat_update(
-                channel=self._channel, ts=self._msg_ts, text=head, mrkdwn=True,
+                channel=self._channel, ts=self._msg_ts, markdown_text=head,
             )
         else:  # _open failed — post fresh
             await self._client.chat_postMessage(
-                channel=self._channel, thread_ts=self._thread_ts, text=head, mrkdwn=True,
+                channel=self._channel, thread_ts=self._thread_ts, markdown_text=head,
             )
         for chunk in rest:
             await self._client.chat_postMessage(
-                channel=self._channel, thread_ts=self._thread_ts, text=chunk, mrkdwn=True,
+                channel=self._channel, thread_ts=self._thread_ts, markdown_text=chunk,
             )
 
 
@@ -576,9 +582,10 @@ class _NullReporter(ProgressReporter):
         await self._post_final(message)
 
     async def _post_final(self, text: str) -> None:
-        for chunk in _split_message(text):
+        # markdown_text so Claude's markdown renders (see ChatUpdateReporter._close).
+        for chunk in _split_message(text, MARKDOWN_TEXT_MAX):
             await self._client.chat_postMessage(
-                channel=self._channel, thread_ts=self._thread_ts, text=chunk, mrkdwn=True,
+                channel=self._channel, thread_ts=self._thread_ts, markdown_text=chunk,
             )
 
 
