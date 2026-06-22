@@ -1,7 +1,14 @@
+# --- Secrets & deployment-local config (never commit) ---
 .mcp.json
 .env
-.claude/
 projects.json
+# host-specific notes, tokens, backups — see private/README.md
+private/
+
+# --- Claude Code local state ---
+.claude/
+
+# --- Python ---
 __pycache__/
 *.pyc
 .pytest_cache/

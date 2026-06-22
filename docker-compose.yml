@@ -14,4 +14,8 @@ services:
       - ${HOME}/.claude/.credentials.json:/home/appuser/.claude/.credentials.json:ro
       # Mount all projects so claude -p can run from the correct project directory
       - ${PROJECTS_DIR}:/projects
+      # Mount the channel→project routing config live, so edits take effect on
+      # restart without rebuilding the image (was baked in before — host edits
+      # never reached the container).
+      - ./projects.json:/app/projects.json
     restart: unless-stopped
