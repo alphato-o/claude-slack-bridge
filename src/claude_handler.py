@@ -415,43 +415,52 @@ class ClaudeHandler:
             asyncio.gather(stdout_task, stderr_task, process.wait())
         )
         wd = asyncio.ensure_future(watchdog())
-        done, _ = await asyncio.wait({work, wd}, return_when=asyncio.FIRST_COMPLETED)
+        try:
+            done, _ = await asyncio.wait({work, wd}, return_when=asyncio.FIRST_COMPLETED)
 
-        if work not in done:
-            # Watchdog fired first — the run stalled. Kill and report.
-            reason = wd.result()
-            process.kill()
-            await process.wait()
-            work.cancel()
-            stdout_task.cancel()
-            stderr_task.cancel()
-            elapsed = int(time.monotonic() - start)
-            idle = int(time.monotonic() - last_activity)
-            logger.error(
-                "Claude subprocess killed (%s) after %ds elapsed / %ds idle (last result=%r)",
-                reason, elapsed, idle, (final_result or "")[:200],
-            )
-            if final_result:
-                return final_result  # got a result right before the cap — use it
-            mins = IDLE_TIMEOUT // 60 if reason == "idle" else MAX_RUNTIME // 60
-            why = (f"went quiet for {mins} min (looked stuck)" if reason == "idle"
-                   else f"hit the {mins // 60} h max-runtime cap")
-            return f"_(I stopped — the run {why}. Reply in this thread to continue where I left off.)_"
+            if work not in done:
+                # Watchdog fired first — the run stalled (the finally kills it).
+                reason = wd.result()
+                elapsed = int(time.monotonic() - start)
+                idle = int(time.monotonic() - last_activity)
+                logger.error(
+                    "Claude subprocess stalled (%s) after %ds elapsed / %ds idle (last result=%r)",
+                    reason, elapsed, idle, (final_result or "")[:200],
+                )
+                if final_result:
+                    return final_result  # got a result right before the cap — use it
+                mins = IDLE_TIMEOUT // 60 if reason == "idle" else MAX_RUNTIME // 60
+                why = (f"went quiet for {mins} min (looked stuck)" if reason == "idle"
+                       else f"hit the {mins // 60} h max-runtime cap")
+                return f"_(I stopped — the run {why}. Reply in this thread to continue where I left off.)_"
 
-        wd.cancel()
-        await work  # surface any consumer/process exception
+            await work  # surface any consumer/process exception
 
-        if process.returncode != 0:
-            logger.error(
-                "Claude CLI failed (rc=%d) cmd=%s prompt=%r",
-                process.returncode, cmd, prompt[:200],
-            )
-            return "Sorry, I encountered an error processing your request."
+            if process.returncode != 0:
+                logger.error(
+                    "Claude CLI failed (rc=%d) cmd=%s prompt=%r",
+                    process.returncode, cmd, prompt[:200],
+                )
+                return "Sorry, I encountered an error processing your request."
 
-        if final_result is None:
-            logger.warning("Claude stream ended with no result event.")
-            return "Sorry, I couldn't parse the response."
-        return final_result
+            if final_result is None:
+                logger.warning("Claude stream ended with no result event.")
+                return "Sorry, I couldn't parse the response."
+            return final_result
+        finally:
+            # Guarantee no orphaned subprocess or tasks — covers the watchdog stall
+            # AND a hard interrupt (the turn task is cancelled, raising CancelledError
+            # here; we must still kill claude -p so it doesn't run on detached).
+            wd.cancel()
+            if process.returncode is None:
+                try:
+                    process.kill()
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except Exception:
+                    pass
+            for t in (stdout_task, stderr_task, work):
+                if not t.done():
+                    t.cancel()
 
     @staticmethod
     def _log_stream_event(event: Any) -> None:

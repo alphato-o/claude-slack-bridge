@@ -16,6 +16,7 @@ the Claude Code CLI, and the response is posted back as a thread reply.
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -48,6 +49,9 @@ class SlackDaemon:
         self._lock = asyncio.Lock()
         self._claude = ClaudeHandler(slack_client=self._app.client)
         self._active_threads: set[str] = set()
+        self._run_tasks: dict[str, asyncio.Task] = {}  # thread_ts → in-flight run task
+        self._queued: dict[str, list[str]] = {}        # thread_ts → messages to apply next turn
+        self._seen_ts: dict[str, float] = {}           # event ts → seen-at (dedupe双-fire)
         self._bot_user_id: str = ""
 
         self._access_control = AccessControl(SecurityConfig.from_env())
@@ -58,6 +62,16 @@ class SlackDaemon:
         # Filter: Ignore bot messages (prevents self-echo loops).
         if event.get("bot_id"):
             return
+
+        # Dedupe: a mention can arrive as BOTH a `message` and an `app_mention`
+        # event with the same ts; process each user message exactly once.
+        evt_ts = event.get("ts", "")
+        if evt_ts:
+            now = time.monotonic()
+            self._seen_ts = {k: v for k, v in self._seen_ts.items() if now - v < 120}
+            if evt_ts in self._seen_ts:
+                return
+            self._seen_ts[evt_ts] = now
 
         user_id: str = event.get("user", "")
         channel: str = event.get("channel", "")
@@ -95,11 +109,15 @@ class SlackDaemon:
                     writer.close()
                 return
 
-        # Case 2: Threaded reply with NO pending session — continue Claude conversation.
+        # Case 2: Threaded reply with NO pending session.
         if thread_ts:
             if thread_ts in self._active_threads:
+                # A run is in flight — interrupt (hard) or queue (soft) instead of
+                # silently dropping the message.
+                await self._handle_busy(channel, thread_ts, text)
                 return
-            asyncio.create_task(self._handle_claude_thread_reply(channel, thread_ts, text, user_id))
+            self._active_threads.add(thread_ts)  # claim synchronously (close the race)
+            asyncio.create_task(self._run_turn(channel, thread_ts, text, user_id, is_new=False))
             return
 
         # Case 3: Top-level message — only respond if the bot is mentioned.
@@ -112,8 +130,10 @@ class SlackDaemon:
 
         message_ts: str = event.get("ts", "")
         if message_ts in self._active_threads:
+            await self._handle_busy(channel, message_ts, text)
             return
-        asyncio.create_task(self._handle_claude_new_message(channel, message_ts, text, user_id))
+        self._active_threads.add(message_ts)
+        asyncio.create_task(self._run_turn(channel, message_ts, text, user_id, is_new=True))
 
     async def _handle_app_mention(self, event: dict[str, Any]) -> None:
         """Handle app_mention events (bot @mentioned in any channel)."""
@@ -142,37 +162,101 @@ class SlackDaemon:
             user_id=user_id, team_id=self._claude._team_id,
         )
 
-    async def _handle_claude_new_message(
-        self, channel: str, message_ts: str, text: str, user_id: str = ""
+    async def _run_turn(
+        self, channel: str, thread_ts: str, text: str,
+        user_id: str = "", is_new: bool = False,
     ) -> None:
-        """Spawn Claude for a new top-level message and stream progress to the thread."""
-        self._active_threads.add(message_ts)
-        reporter = self._make_reporter(channel, message_ts, user_id)
-        try:
-            await reporter.start()
-            response = await self._claude.handle_message(channel, message_ts, text, reporter)
-            await reporter.finish(response)
-        except Exception as exc:
-            logger.error("Error handling top-level message %s: %s", message_ts, exc)
-            await reporter.fail("Sorry, I encountered an error processing your request.")
-        finally:
-            self._active_threads.discard(message_ts)
+        """Run one Claude turn for *thread_ts*, tracked so it can be interrupted.
 
-    async def _handle_claude_thread_reply(
-        self, channel: str, thread_ts: str, text: str, user_id: str = ""
-    ) -> None:
-        """Spawn Claude for a thread reply and stream progress to the thread."""
+        On normal completion or interrupt, any messages queued meanwhile (soft
+        interrupts, or the instruction that followed a hard stop) are drained as
+        the next turn — so nothing a user sends mid-task is ever lost.
+        """
         self._active_threads.add(thread_ts)
+        self._run_tasks[thread_ts] = asyncio.current_task()  # type: ignore[assignment]
         reporter = self._make_reporter(channel, thread_ts, user_id)
         try:
             await reporter.start()
-            response = await self._claude.handle_thread_reply(channel, thread_ts, text, reporter)
+            if is_new:
+                response = await self._claude.handle_message(channel, thread_ts, text, reporter)
+            else:
+                response = await self._claude.handle_thread_reply(channel, thread_ts, text, reporter)
             await reporter.finish(response)
+        except asyncio.CancelledError:
+            # Intentional hard interrupt — finalize the stream, don't treat as error.
+            logger.info("Turn on %s hard-interrupted.", thread_ts)
+            try:
+                await reporter.fail("⏹️ Stopped.")
+            except Exception:
+                pass
         except Exception as exc:
-            logger.error("Error in thread continuation %s: %s", thread_ts, exc)
-            await reporter.fail("Sorry, I encountered an error processing your request.")
+            logger.error("Error in turn on %s: %s", thread_ts, exc)
+            try:
+                await reporter.fail("Sorry, I encountered an error processing your request.")
+            except Exception:
+                pass
         finally:
             self._active_threads.discard(thread_ts)
+            if self._run_tasks.get(thread_ts) is asyncio.current_task():
+                self._run_tasks.pop(thread_ts, None)
+            queued = self._queued.pop(thread_ts, None)
+            if queued:
+                combined = "\n\n".join(queued)
+                logger.info("Draining %d queued msg(s) on %s as the next turn.", len(queued), thread_ts)
+                self._active_threads.add(thread_ts)  # claim before the await gap
+                asyncio.create_task(
+                    self._run_turn(channel, thread_ts, combined, user_id, is_new=False))
+
+    async def _handle_busy(self, channel: str, thread_ts: str, text: str) -> None:
+        """A message arrived while a run is in flight: hard-interrupt (kill the
+        current run, then run the new instruction) or soft-interrupt (queue it for
+        the next turn)."""
+        kind, remainder = self._classify_interrupt(text)
+        if kind == "hard":
+            logger.info("Hard interrupt on %s (remainder=%r).", thread_ts, remainder[:80])
+            if remainder:
+                self._queued.setdefault(thread_ts, []).append(remainder)
+            note = "⏹️ _Stopping the current run…_"
+            if remainder:
+                note += " I'll run your new instruction next."
+            await self._post(channel, thread_ts, note)
+            task = self._run_tasks.get(thread_ts)
+            if task and not task.done():
+                task.cancel()  # its finally drains the queue → starts the new turn
+            return
+        # Soft: queue for the next turn (matches typing while the CLI is working).
+        self._queued.setdefault(thread_ts, []).append(text)
+        logger.info("Soft-queued on busy %s: %r", thread_ts, text[:80])
+        await self._post(
+            channel, thread_ts,
+            "📨 _Got it — I'll fold this into the next turn (I'm mid-task). "
+            "Send `!` (or `停`/`stop`) first to interrupt now instead._",
+        )
+
+    @staticmethod
+    def _classify_interrupt(text: str) -> tuple[str, str]:
+        """Classify a mid-task message. Returns ``("hard", remainder)`` for a stop
+        request (leading ``!`` or a stop-word; *remainder* becomes the next
+        instruction) or ``("soft", text)`` to queue it."""
+        s = text.strip()
+        if s.startswith("!"):
+            return "hard", s[1:].strip()
+        low = s.lower()
+        stop_exact = {"stop", "停", "停止", "停下", "打断", "中断", "abort", "cancel"}
+        if low in stop_exact or s in stop_exact:
+            return "hard", ""
+        for w in ("停止", "停下", "中断", "打断", "停", "stop", "abort", "cancel"):
+            if s.startswith(w + " ") or low.startswith(w + " "):
+                return "hard", s[len(w):].lstrip(" :,，、").strip()
+        return "soft", s
+
+    async def _post(self, channel: str, thread_ts: str, text: str) -> None:
+        """Best-effort tiny acknowledgement in the thread."""
+        try:
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, text=text, mrkdwn=True)
+        except Exception as exc:
+            logger.debug("ack post failed: %s", exc)
 
     async def _handle_session_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
