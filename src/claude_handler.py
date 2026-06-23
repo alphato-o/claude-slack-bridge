@@ -30,13 +30,21 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SUBPROCESS_TIMEOUT = 300  # 5 minutes
+# Flow-B runs are real work that can legitimately take 30–60+ min, so we do NOT
+# cap total wall-clock blindly. Instead an inactivity watchdog kills the run only
+# when it produces NO output for IDLE_TIMEOUT seconds (a genuinely stuck process),
+# resetting on every stream event. MAX_RUNTIME is a generous hard backstop against
+# a runaway that keeps emitting forever. Both overridable via env.
+IDLE_TIMEOUT = int(os.getenv("FLOW_B_IDLE_TIMEOUT", "1200"))   # 20 min of silence
+MAX_RUNTIME = int(os.getenv("FLOW_B_MAX_RUNTIME", "14400"))    # 4 h hard cap
+WATCHDOG_INTERVAL = 15  # how often the watchdog checks (seconds)
 # Claude CLI in stream-json mode emits one JSON event per line. A single
 # event can embed large tool inputs/results (file reads, MCP responses,
 # task outputs), easily exceeding asyncio's default 64 KB StreamReader
@@ -351,11 +359,14 @@ class ClaudeHandler:
         process.stdin.close()
 
         final_result: str | None = None
+        start = time.monotonic()
+        last_activity = start
 
         async def consume_stdout() -> None:
-            nonlocal final_result
+            nonlocal final_result, last_activity
             assert process.stdout is not None
             async for raw_line in process.stdout:
+                last_activity = time.monotonic()  # any output = alive, reset idle
                 line = raw_line.decode("utf-8", errors="replace").rstrip()
                 if not line:
                     continue
@@ -378,8 +389,10 @@ class ClaudeHandler:
                     final_result = event["result"]
 
         async def consume_stderr() -> None:
+            nonlocal last_activity
             assert process.stderr is not None
             async for raw_line in process.stderr:
+                last_activity = time.monotonic()
                 line = raw_line.decode("utf-8", errors="replace").rstrip()
                 if line:
                     logger.warning("claude stderr: %s", line[:1000])
@@ -387,21 +400,46 @@ class ClaudeHandler:
         stdout_task = asyncio.create_task(consume_stdout())
         stderr_task = asyncio.create_task(consume_stderr())
 
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(stdout_task, stderr_task, process.wait()),
-                timeout=SUBPROCESS_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
+        # Inactivity watchdog: kill only on genuine silence or the hard backstop,
+        # never on total elapsed while output keeps flowing.
+        async def watchdog() -> str:
+            while True:
+                await asyncio.sleep(WATCHDOG_INTERVAL)
+                now = time.monotonic()
+                if now - last_activity > IDLE_TIMEOUT:
+                    return "idle"
+                if now - start > MAX_RUNTIME:
+                    return "max"
+
+        work = asyncio.ensure_future(
+            asyncio.gather(stdout_task, stderr_task, process.wait())
+        )
+        wd = asyncio.ensure_future(watchdog())
+        done, _ = await asyncio.wait({work, wd}, return_when=asyncio.FIRST_COMPLETED)
+
+        if work not in done:
+            # Watchdog fired first — the run stalled. Kill and report.
+            reason = wd.result()
             process.kill()
             await process.wait()
+            work.cancel()
             stdout_task.cancel()
             stderr_task.cancel()
+            elapsed = int(time.monotonic() - start)
+            idle = int(time.monotonic() - last_activity)
             logger.error(
-                "Claude subprocess timed out after %ds (last result=%r)",
-                SUBPROCESS_TIMEOUT, (final_result or "")[:200],
+                "Claude subprocess killed (%s) after %ds elapsed / %ds idle (last result=%r)",
+                reason, elapsed, idle, (final_result or "")[:200],
             )
-            return "Sorry, the request timed out. Please try again."
+            if final_result:
+                return final_result  # got a result right before the cap — use it
+            mins = IDLE_TIMEOUT // 60 if reason == "idle" else MAX_RUNTIME // 60
+            why = (f"went quiet for {mins} min (looked stuck)" if reason == "idle"
+                   else f"hit the {mins // 60} h max-runtime cap")
+            return f"_(I stopped — the run {why}. Reply in this thread to continue where I left off.)_"
+
+        wd.cancel()
+        await work  # surface any consumer/process exception
 
         if process.returncode != 0:
             logger.error(
