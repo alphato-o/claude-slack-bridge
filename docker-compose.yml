@@ -23,4 +23,12 @@ services:
       # restart without rebuilding the image (was baked in before — host edits
       # never reached the container).
       - ./projects.json:/app/projects.json
+      # Persist the container's ~/.claude (session transcripts, the bridge's
+      # channel→session map, and journals) so a restart doesn't wipe a project's
+      # conversation history — without this, every rebuild forces Claude to
+      # re-explore from scratch.
+      - claude-home:/home/appuser/.claude
     restart: unless-stopped
+
+volumes:
+  claude-home:

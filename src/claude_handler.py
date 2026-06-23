@@ -32,6 +32,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +115,78 @@ def _load_project_map() -> dict[str, Any]:
     return mapping
 
 
+# --- Cross-session continuity state (persisted in the ~/.claude volume) ---------
+CLAUDE_HOME = Path(os.path.expanduser("~/.claude"))
+SESSIONS_FILE = CLAUDE_HOME / "bridge-sessions.json"  # cwd → continuous session id
+JOURNAL_DIR = CLAUDE_HOME / "bridge-journals"         # per-cwd durable work log
+JOURNAL_INJECT_CHARS = 3500   # how much journal tail to seed a fresh session with
+JOURNAL_ASK_CHARS = 300
+JOURNAL_DID_CHARS = 700
+
+
+def _trim(text: str, limit: int) -> str:
+    flat = " ".join((text or "").split())
+    return flat[: limit - 1] + "…" if len(flat) > limit else flat
+
+
+def _load_sessions() -> dict[str, str]:
+    try:
+        return json.loads(SESSIONS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_sessions(mapping: dict[str, str]) -> None:
+    try:
+        SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSIONS_FILE.write_text(json.dumps(mapping, indent=2))
+    except Exception as exc:
+        logger.warning("Could not persist bridge session map: %s", exc)
+
+
+def _session_file_exists(project_dir: str | None, session_id: str) -> bool:
+    """True if Claude's on-disk transcript for this session exists, so we can
+    safely ``--resume`` it (vs re-creating it with ``--session-id``)."""
+    if not project_dir:
+        return False
+    slug = project_dir.replace("/", "-")
+    return (CLAUDE_HOME / "projects" / slug / f"{session_id}.jsonl").exists()
+
+
+def _journal_file(cwd_key: str) -> Path:
+    return JOURNAL_DIR / (re.sub(r"[^A-Za-z0-9_.-]", "_", cwd_key) + ".md")
+
+
+def _journal_tail(cwd_key: str) -> str:
+    try:
+        return _journal_file(cwd_key).read_text()[-JOURNAL_INJECT_CHARS:].strip()
+    except Exception:
+        return ""
+
+
+def _append_journal(cwd_key: str, request: str, result: str) -> None:
+    """Append a compact entry to the project's durable work log. This survives
+    session compaction, ``/new``, and (via the volume) restarts — the durable
+    backbone behind the verbatim session."""
+    try:
+        f = _journal_file(cwd_key)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        new = not f.exists()
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with open(f, "a") as fh:
+            if new:
+                fh.write(
+                    "# Bridge journal\n\n_Durable log of Slack-driven work in this "
+                    "project, kept by claude-slack-bridge. Seeded into a fresh session "
+                    "so a new conversation knows the recent history._\n")
+            fh.write(
+                f"\n## {stamp}\n"
+                f"**Asked:** {_trim(request, JOURNAL_ASK_CHARS)}\n\n"
+                f"**Did:** {_trim(result, JOURNAL_DID_CHARS)}\n")
+    except Exception as exc:
+        logger.debug("journal append failed: %s", exc)
+
+
 class ClaudeHandler:
     """
     Manages Claude Code CLI invocations for Slack messages.
@@ -126,21 +199,27 @@ class ClaudeHandler:
         self._slack_client = slack_client
         self._bot_user_id: str = ""
         self._team_id: str = ""
-        self._sessions: dict[str, str] = {}  # thread_ts → session UUID
         self._project_map: dict[str, Any] = _load_project_map()
         # Resolved at startup: channel ID → {"path": str|None, "plugin_dir": str|None,
         #                                    "worktrees": dict[str, str]}
         self._channel_id_to_project: dict[str, dict] = {}
-        # thread_ts → (cwd, plugin_dir) chosen when the thread started, so
-        # replies stay in the same worktree without re-tagging.
-        self._thread_config: dict[str, tuple[str | None, str | None]] = {}
+        # ONE continuous Claude session PER WORKING DIRECTORY (cwd key → session id),
+        # so a new @mention resumes the project's ongoing conversation instead of
+        # starting cold. Persisted to the volume so it survives restarts.
+        self._session: dict[str, str] = _load_sessions()
+        # Per-cwd lock: only one run may use a given session at a time (you can't
+        # --resume the same session concurrently). Same-cwd runs serialize here.
+        self._cwd_locks: dict[str, asyncio.Lock] = {}
 
     async def initialize(self) -> None:
         """Cache the bot's own user ID and resolve channel names to IDs."""
         resp = await self._slack_client.auth_test()
         self._bot_user_id = resp["user_id"]
         self._team_id = resp.get("team_id", "")
-        logger.info("ClaudeHandler initialized, bot_user_id=%s", self._bot_user_id)
+        logger.info(
+            "ClaudeHandler initialized, bot_user_id=%s (%d persisted project sessions)",
+            self._bot_user_id, len(self._session),
+        )
 
         if self._project_map:
             await self._resolve_channel_ids()
@@ -149,41 +228,83 @@ class ClaudeHandler:
     # Public API
     # ------------------------------------------------------------------
 
+    # Both Slack entry points (new mention, thread reply) run one continuous
+    # per-project conversation, so these are thin wrappers over handle_turn.
     async def handle_message(
         self, channel: str, message_ts: str, text: str, reporter: Any = None
     ) -> str:
-        """Handle a new top-level Slack message (start a new Claude session)."""
-        label, text = _parse_worktree_tag(text)
-        project_dir, plugin_dir = self._get_project_config(channel, label)
-
-        session_id = str(uuid.uuid4())
-        self._sessions[message_ts] = session_id
-        self._thread_config[message_ts] = (project_dir, plugin_dir)
-        logger.info("New Claude session %s for thread %s", session_id, message_ts)
-
-        cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
-        return await self._run_claude(cmd, text, cwd=project_dir, reporter=reporter)
+        return await self.handle_turn(channel, text, reporter)
 
     async def handle_thread_reply(
         self, channel: str, thread_ts: str, text: str, reporter: Any = None
     ) -> str:
-        """Handle a threaded reply (resume existing session or fallback)."""
-        session_id = self._sessions.get(thread_ts)
-        # Thread inherits the worktree chosen at start; re-tagging mid-thread
-        # would be confusing, so we don't re-parse here. Falls back to default
-        # config only if the thread state was lost (container restart).
-        project_dir, plugin_dir = self._thread_config.get(thread_ts) or self._get_project_config(channel)
+        return await self.handle_turn(channel, text, reporter)
 
-        if session_id:
-            logger.info("Resuming session %s for thread %s", session_id, thread_ts)
+    async def handle_turn(self, channel: str, text: str, reporter: Any = None) -> str:
+        """Run one turn, resuming the project's continuous Claude session.
+
+        Continuity is keyed by working directory: every @mention/reply for a
+        project resumes the same session, so a new request inherits the prior
+        conversation instead of starting cold. ``/new`` (optionally followed by
+        an instruction) starts a fresh session; a fresh session is seeded with
+        the project's durable journal so it still knows recent history.
+        """
+        force_new = False
+        stripped = text.lstrip()
+        if stripped == "/new" or stripped[:5] in ("/new ", "/new\n"):
+            force_new = True
+            text = stripped[4:].strip()
+
+        label, text = _parse_worktree_tag(text)
+        project_dir, plugin_dir = self._get_project_config(channel, label)
+        cwd_key = project_dir or f"chan:{channel}"
+
+        if force_new and not text:
+            self._session.pop(cwd_key, None)
+            _save_sessions(self._session)
+            return "🆕 Started a fresh conversation for this project. What would you like me to do?"
+
+        session_id, resume = self._session_for(cwd_key, project_dir, force_new)
+        prompt = text
+        if resume:
+            logger.info("Resuming session %s for %s", session_id, cwd_key)
             cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir)
-            return await self._run_claude(cmd, text, cwd=project_dir, reporter=reporter)
+        else:
+            logger.info("New session %s for %s%s", session_id, cwd_key,
+                        " (/new)" if force_new else "")
+            tail = _journal_tail(cwd_key)
+            if tail:
+                prompt = (
+                    "## Earlier work in this project (prior Slack sessions — context only)\n"
+                    f"{tail}\n\n---\n\n## Current request\n{text}"
+                )
+            cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
 
-        # Fallback: session lost (container restart) — use thread history as context.
-        logger.info("No session for thread %s, falling back to thread history.", thread_ts)
-        prompt = await self._build_thread_prompt(channel, thread_ts)
-        cmd = self._build_cmd(plugin_dir=plugin_dir)
-        return await self._run_claude(cmd, prompt, cwd=project_dir, reporter=reporter)
+        async with self._lock_for(cwd_key):
+            result = await self._run_claude(cmd, prompt, cwd=project_dir, reporter=reporter)
+        _append_journal(cwd_key, text, result)
+        return result
+
+    def _lock_for(self, cwd_key: str) -> asyncio.Lock:
+        lock = self._cwd_locks.get(cwd_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cwd_locks[cwd_key] = lock
+        return lock
+
+    def _session_for(
+        self, cwd_key: str, project_dir: str | None, force_new: bool
+    ) -> tuple[str, bool]:
+        """Return (session_id, resume?) for a cwd. Creates+persists a new id on
+        first use or ``/new``; otherwise resumes the stored id when its transcript
+        exists on disk (else re-creates it with that id — never a failed resume)."""
+        if force_new or cwd_key not in self._session:
+            sid = str(uuid.uuid4())
+            self._session[cwd_key] = sid
+            _save_sessions(self._session)
+            return sid, False
+        sid = self._session[cwd_key]
+        return sid, _session_file_exists(project_dir, sid)
 
     # ------------------------------------------------------------------
     # Internals
