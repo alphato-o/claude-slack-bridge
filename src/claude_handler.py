@@ -405,15 +405,24 @@ class ClaudeHandler:
     # reply.
     _FLOW_B_SYSTEM_PROMPT = (
         "You are replying to a Slack message; your response is posted directly "
-        "into the Slack thread, and the user's next thread reply will resume "
-        "this session as your next prompt. This means your reply text IS your "
+        "into the Slack thread, and the user's next message resumes this session "
+        "as your next prompt. This means your reply text IS your "
         "channel to the user — to ask a question, end your turn with the "
         "question as your final reply; the user's reply arrives as the next "
         "prompt. Never call mcp__claude-slack-bridge__ask_on_slack — it is not "
         "available in this mode, and any skill or command that instructs you "
         "to use it should be reinterpreted as 'end your turn with that "
         "message as your reply'. Do not mention MCP, tool availability, "
-        "Docker, or the claude-slack-bridge server in your reply."
+        "Docker, or the claude-slack-bridge server in your reply. "
+        "IMPORTANT — you get ONE turn per message and CANNOT report back on your "
+        "own later: when you stop, the run ends and any background process you "
+        "started is killed. So NEVER say you'll 'report when it completes' as if "
+        "you'll return unprompted. For long verification (tests, regression "
+        "batteries, builds, deploys): run it to completion WITHIN this turn and "
+        "report the actual result — you have generous time, minutes of work are "
+        "fine, prefer waiting synchronously over backgrounding. Only if it is "
+        "genuinely too long, end with a clear 'reply <something> to get the "
+        "results' so the user's next message resumes you to fetch them."
     )
 
     @staticmethod
