@@ -65,6 +65,6 @@ class TestNewCommand:
         h._channel_id_to_project = {}  # unmapped → default cwd key chan:<id>
         h._session = {"chan:C1": "old-session"}
 
-        res = asyncio.run(h.handle_turn("C1", "/new"))
+        res = asyncio.run(h.handle_turn("C1", "1782200000.0", "/new"))
         assert "fresh conversation" in res.lower()
         assert "chan:C1" not in h._session  # session was reset

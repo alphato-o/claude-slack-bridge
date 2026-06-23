@@ -14,6 +14,7 @@ the Claude Code CLI, and the response is posted back as a thread reply.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -177,10 +178,7 @@ class SlackDaemon:
         reporter = self._make_reporter(channel, thread_ts, user_id)
         try:
             await reporter.start()
-            if is_new:
-                response = await self._claude.handle_message(channel, thread_ts, text, reporter)
-            else:
-                response = await self._claude.handle_thread_reply(channel, thread_ts, text, reporter)
+            response = await self._claude.handle_turn(channel, thread_ts, text, reporter)
             await reporter.finish(response)
         except asyncio.CancelledError:
             # Intentional hard interrupt — finalize the stream, don't treat as error.
@@ -258,16 +256,51 @@ class SlackDaemon:
         except Exception as exc:
             logger.debug("ack post failed: %s", exc)
 
+    async def _handle_notify(self, payload: str, writer: asyncio.StreamWriter) -> None:
+        """Post a message to Slack for a token-less helper. Payload is one JSON
+        line: {"channel":..., "thread_ts":..., "text":...}."""
+        try:
+            data = json.loads(payload)
+            await self._app.client.chat_postMessage(
+                channel=data["channel"],
+                thread_ts=data.get("thread_ts") or None,
+                markdown_text=data["text"],
+            )
+            logger.info(
+                "bridge_notify → channel=%s thread=%s (%d chars)",
+                data.get("channel"), data.get("thread_ts"), len(data.get("text", "")),
+            )
+            writer.write(b"OK\n")
+        except Exception as exc:
+            logger.warning("bridge_notify failed: %s", exc)
+            try:
+                writer.write(b"ERR\n")
+            except Exception:
+                pass
+        try:
+            await writer.drain()
+        except Exception:
+            pass
+
     async def _handle_session_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         thread_ts: str | None = None
         try:
             line = await asyncio.wait_for(reader.readline(), timeout=10.0)
-            parts = line.decode().strip().split(" ", 1)
+            parts = line.decode().rstrip("\n").split(" ", 1)
+            cmd = parts[0] if parts else ""
 
-            if len(parts) != 2 or parts[0] != "REGISTER":
-                logger.warning("Bad session registration: %r", line)
+            # Fire-and-forget notify: a token-less Flow-B helper (bridge_notify.py)
+            # asks the daemon to post a message back to a thread — used so a
+            # backgrounded script can return its result to the thread that started
+            # it after the Claude turn has ended. The bot token never leaves here.
+            if cmd == "NOTIFY" and len(parts) == 2:
+                await self._handle_notify(parts[1], writer)
+                return
+
+            if cmd != "REGISTER" or len(parts) != 2:
+                logger.warning("Bad socket command: %r", line)
                 return
 
             thread_ts = parts[1]

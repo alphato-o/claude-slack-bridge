@@ -187,6 +187,24 @@ def _append_journal(cwd_key: str, request: str, result: str) -> None:
         logger.debug("journal append failed: %s", exc)
 
 
+def _anchor_addendum(channel: str, thread_ts: str) -> str:
+    """System-prompt addendum telling Claude its Slack location anchor, and how a
+    job that outlives the turn can post its result back to THIS thread."""
+    return (
+        f" SLACK ANCHOR — you are in channel {channel}, thread_ts {thread_ts}; "
+        "this turn's replies land in this thread. If you must run work that "
+        "OUTLIVES this turn (a long battery/build/script you can't reasonably wait "
+        "out), do NOT say you'll 'report later' — a detached job can post its OWN "
+        "result back to this thread when it finishes by piping output to "
+        f"`python /app/src/bridge_notify.py --channel {channel} --thread-ts {thread_ts}` "
+        "(no token needed — the daemon posts it). For example: "
+        f"`nohup sh -c 'run_the_battery; summarize | python /app/src/bridge_notify.py "
+        f"--channel {channel} --thread-ts {thread_ts}' >/tmp/job.log 2>&1 &`. "
+        "Prefer finishing within the turn and reporting inline (you have ~20 min of "
+        "idle headroom); use the detached-notify pattern only for genuinely long jobs."
+    )
+
+
 class ClaudeHandler:
     """
     Manages Claude Code CLI invocations for Slack messages.
@@ -233,14 +251,16 @@ class ClaudeHandler:
     async def handle_message(
         self, channel: str, message_ts: str, text: str, reporter: Any = None
     ) -> str:
-        return await self.handle_turn(channel, text, reporter)
+        return await self.handle_turn(channel, message_ts, text, reporter)
 
     async def handle_thread_reply(
         self, channel: str, thread_ts: str, text: str, reporter: Any = None
     ) -> str:
-        return await self.handle_turn(channel, text, reporter)
+        return await self.handle_turn(channel, thread_ts, text, reporter)
 
-    async def handle_turn(self, channel: str, text: str, reporter: Any = None) -> str:
+    async def handle_turn(
+        self, channel: str, thread_ts: str, text: str, reporter: Any = None
+    ) -> str:
         """Run one turn, resuming the project's continuous Claude session.
 
         Continuity is keyed by working directory: every @mention/reply for a
@@ -264,21 +284,27 @@ class ClaudeHandler:
             _save_sessions(self._session)
             return "🆕 Started a fresh conversation for this project. What would you like me to do?"
 
+        # Tell Claude its Slack anchor so any work that outlives this turn can
+        # report back to THIS thread (token-safely, via bridge_notify).
+        system_prompt = self._FLOW_B_SYSTEM_PROMPT + _anchor_addendum(channel, thread_ts)
+
         session_id, resume = self._session_for(cwd_key, project_dir, force_new)
         prompt = text
         if resume:
-            logger.info("Resuming session %s for %s", session_id, cwd_key)
-            cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir)
+            logger.info("Resuming session %s for %s (thread %s)", session_id, cwd_key, thread_ts)
+            cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir,
+                                  system_prompt=system_prompt)
         else:
-            logger.info("New session %s for %s%s", session_id, cwd_key,
-                        " (/new)" if force_new else "")
+            logger.info("New session %s for %s%s (thread %s)", session_id, cwd_key,
+                        " (/new)" if force_new else "", thread_ts)
             tail = _journal_tail(cwd_key)
             if tail:
                 prompt = (
                     "## Earlier work in this project (prior Slack sessions — context only)\n"
                     f"{tail}\n\n---\n\n## Current request\n{text}"
                 )
-            cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
+            cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir,
+                                  system_prompt=system_prompt)
 
         async with self._lock_for(cwd_key):
             result = await self._run_claude(cmd, prompt, cwd=project_dir, reporter=reporter)
@@ -430,6 +456,7 @@ class ClaudeHandler:
         session_id: str | None = None,
         resume: str | None = None,
         plugin_dir: str | None = None,
+        system_prompt: str | None = None,
     ) -> list[str]:
         # stream-json + --verbose makes the CLI emit one event per line on
         # stdout (system/init, assistant text, thinking, tool_use,
@@ -438,7 +465,7 @@ class ClaudeHandler:
         cmd = [
             "claude", "-p",
             "--dangerously-skip-permissions",
-            "--append-system-prompt", ClaudeHandler._FLOW_B_SYSTEM_PROMPT,
+            "--append-system-prompt", system_prompt or ClaudeHandler._FLOW_B_SYSTEM_PROMPT,
             "--output-format", "stream-json",
             "--verbose",
         ]
