@@ -10,8 +10,13 @@ services:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - GH_TOKEN=${GITHUB_TOKEN}
     volumes:
-      # Mount Claude CLI credentials (read-only); CLI writes session data inside the container
-      - ${HOME}/.claude/.credentials.json:/home/appuser/.claude/.credentials.json:ro
+      # Mount the host ~/.claude DIRECTORY (read-only) so the credentials file
+      # survives Claude's atomic-rename token refresh. A single-file bind mount
+      # detaches when the host rewrites .credentials.json (new inode) on each
+      # OAuth refresh, making the file vanish in the container ("Not logged in").
+      # entrypoint.sh symlinks /host-claude/.credentials.json into the container's
+      # own writable ~/.claude (which still holds the CLI's session data).
+      - ${HOME}/.claude:/host-claude:ro
       # Mount all projects so claude -p can run from the correct project directory
       - ${PROJECTS_DIR}:/projects
       # Mount the channel→project routing config live, so edits take effect on
