@@ -1,23 +1,43 @@
-# Claude ↔ Slack Bridge
+# Claude ↔ Slack Bridge — a self-hosted Claude Tag
 
-A two-way bridge between Claude Code and Slack:
+> On **June 23, 2026** Anthropic launched [**Claude Tag**](https://www.anthropic.com/news/introducing-claude-tag): Claude as a Slack teammate you `@mention` to delegate work — **one shared Claude per channel** that remembers context, picks up where anyone left off, and runs on Opus 4.8. It's a paid Team/Enterprise, Anthropic-hosted product.
+>
+> **This is the open-source, self-hosted equivalent.** `@mention` Claude in a Slack channel and it works in your *real* repo, **streams its work live** (tokens, tool calls, a live plan, a "thinking" status), keeps **one shared brain per channel**, **remembers across tasks** (and shares that memory with your *terminal* Claude Code), and routes long-running results back to the right thread. It runs on **your** box, on **your** Claude Code subscription, with **your** tools and full repo access — no Enterprise plan, no data leaving your infra.
 
-- **Claude → Slack:** Claude pauses mid-task, asks a question via Slack, waits for your reply, and resumes.
-- **Slack → Claude:** Tag the bot in a Slack channel and Claude runs with full project context — it knows which project to work on based on the channel.
-
-```
-Claude Code  ──ask_on_slack──▶  Slack channel  ──your reply──▶  Claude Code resumes
-Slack @bot   ──────────────────▶  claude -p (in project dir) ──▶  reply in thread
-```
-
----
 ![slack-claude-small](https://github.com/user-attachments/assets/d4460f40-5c68-48a0-8fc5-9b386881a765)
 
-## What It Does
+## Claude Tag vs this bridge
 
-- **`ask_on_slack` MCP tool** — Claude pauses mid-task, posts a question to Slack, blocks until you reply in the thread, then resumes. Multiple concurrent sessions are routed correctly by `thread_ts`.
-- **Project-aware Slack bot** — `@claude-bot` in a Slack channel spawns `claude -p` in the matching project directory inside the container. Supports git worktrees via a `[label]` prefix.
-- **Full-process plugin** — a turnkey feature-development workflow driven from Slack (`/process start` → pick a task → worktree → design → plan → run-plan → PR per step).
+| | **Claude Tag** (Anthropic) | **This bridge** (self-hosted) |
+|---|---|---|
+| `@mention` Claude in Slack to delegate work | ✅ | ✅ |
+| One shared Claude per channel; pick up where anyone left off | ✅ | ✅ — one continuous session per channel |
+| Watch it work live (streaming, tool/plan widgets, "thinking" status) | ✅ | ✅ — native Slack token streaming |
+| Remembers context from its channels | ✅ | ✅ — persistent per-project memory + journal |
+| Shares memory with your local **Claude Code** terminal | — | ✅ — one unified memory store, both directions |
+| Runs on **Opus 4.8** | ✅ | ✅ — your Claude Code CLI |
+| Works in your real repo & runs your CLI tools | scoped | ✅ — full access to the mapped project dir |
+| Interrupt / redirect mid-task | ✅ | ✅ — soft (queue) + hard (`!`/`停`) interrupts |
+| Hosting | Anthropic cloud | **your infra** (Docker + Slack Socket Mode) |
+| Plan required | Team / Enterprise (paid, per-seat) | **none** — your existing Claude subscription |
+| Where your data lives | Anthropic-managed | **on your machine** |
+
+> Same idea, shipped the same week — but open, free, and yours. ⭐ it if that's your kind of thing.
+
+## What you get
+
+- **Tag Claude in any channel** — `@claude-bot fix the login redirect bug`. It spawns `claude -p` in the matching project directory and works with full repo context. Route each channel to a project (or git worktree) via `projects.json`.
+- **Live, streamed work** — native Slack streaming shows Claude's tokens, tool calls (`📖 Reading…`, `⚡ Running tests`), a live `Task`/`TodoWrite` plan, and an animated "thinking" status — not just a final answer.
+- **One brain per channel, with memory** — every `@mention`/reply continues the same session, so a new task inherits the last one's context; a durable journal + file-based memory persist across restarts. That memory is **bind-mounted to share with your terminal Claude Code** — write a note either side, both see it.
+- **Interrupt like a CLI** — type more mid-task to **queue** it for the next turn, or send `!` / `停` / `stop` to **hard-interrupt** and redirect. Long jobs that outlive a turn report their results **back to the originating thread**.
+- **`ask_on_slack` (Claude → Slack)** — the reverse direction: your terminal Claude pauses mid-task, asks a question in Slack, blocks until you reply in the thread, then resumes. Concurrent sessions routed by `thread_ts`.
+- **Full-process plugin** — a turnkey feature-dev workflow from Slack (`/process start` → pick a task → worktree → design → plan → run-plan → PR per step).
+- **Scoped & private** — per-user / per-channel access control, Slack tokens stripped from the model's environment, Socket Mode (no public URL or inbound firewall rules).
+
+```
+Slack @bot   ──────────────────▶  claude -p (in project dir) ──stream──▶  live thread
+Claude Code  ──ask_on_slack──▶  Slack channel  ──your reply──▶  Claude Code resumes
+```
 
 ---
 
@@ -32,7 +52,7 @@ Follow [docs/slack-setup.md](docs/slack-setup.md) to create a Slack app, get you
 ### 2. Clone, configure, and start the daemon
 
 ```bash
-git clone https://github.com/your-username/claude-slack-bridge.git
+git clone https://github.com/alphato-o/claude-slack-bridge.git
 cd claude-slack-bridge
 cp .env.example .env   # fill in SLACK_BOT_TOKEN and SLACK_APP_TOKEN
 docker compose up -d --build
@@ -141,6 +161,7 @@ The bot lists your open tasks (from Notion, Linear, Jira, …), creates a git wo
 | Route channels to projects | [docs/slack-to-claude-projects.md#projectsjson--channel--project-routing](docs/slack-to-claude-projects.md#projectsjson--channel--project-routing) |
 | Use git worktrees from Slack | [docs/slack-to-claude-projects.md#worktrees](docs/slack-to-claude-projects.md#worktrees) |
 | Run the turnkey feature-dev workflow from Slack | [docs/full-process-plugin.md](docs/full-process-plugin.md) |
+| Share memory between Slack-Claude and terminal-Claude | [docs/memory-unification.md](docs/memory-unification.md) |
 | Configure access control or see all env vars | [docs/security.md](docs/security.md) |
 | Understand the daemon + session internals | [docs/architecture.md](docs/architecture.md) |
 | Use the `/process` GitHub PR workflow | [docs/github-setup.md](docs/github-setup.md) |
