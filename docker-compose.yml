@@ -42,6 +42,8 @@ services:
       # docs/memory-unification.md.
       - ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-RoxImproved/memory:/home/appuser/.claude/projects/-projects-RoxImproved/memory
       - ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-phicampaign/memory:/home/appuser/.claude/projects/-projects-phicampaign/memory
+      # The bridge's own dogfood channel — keep it consistent with the rest.
+      - ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-claude-slack-bridge/memory:/home/appuser/.claude/projects/-projects-claude-slack-bridge/memory
     restart: unless-stopped
 
 volumes:

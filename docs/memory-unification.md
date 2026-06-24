@@ -52,7 +52,9 @@ its real path; the container slug is always `-projects-<P>`.
 
 ## Currently unified
 
-`emmshopify`, `RoxImproved`, `phicampaign` (all in `docker-compose.yml`).
+`emmshopify`, `RoxImproved`, `phicampaign`, `claude-slack-bridge` (the dogfood
+channel) — all in `docker-compose.yml`. Every configured project is unified;
+keep it that way.
 
 > **When wiring any new project into the bridge, do this step too** — it's part
 > of onboarding a project, not optional. (Recorded in memory `bridge-memory-unification`.)
