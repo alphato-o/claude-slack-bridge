@@ -53,6 +53,8 @@ class SlackDaemon:
         self._run_tasks: dict[str, asyncio.Task] = {}  # thread_ts → in-flight run task
         self._queued: dict[str, list[str]] = {}        # thread_ts → messages to apply next turn
         self._seen_ts: dict[str, float] = {}           # event ts → seen-at (dedupe双-fire)
+        self._bot_threads: set[str] = set()            # threads the bot belongs to (engage)
+        self._non_bot_threads: set[str] = set()        # human-only threads (ignore) — cached
         self._bot_user_id: str = ""
 
         self._access_control = AccessControl(SecurityConfig.from_env())
@@ -92,6 +94,8 @@ class SlackDaemon:
 
         thread_ts: str | None = event.get("thread_ts")
         text: str = event.get("text", "")
+        mention_tag = f"<@{self._bot_user_id}>"
+        mentioned = mention_tag in text
 
         # Case 1: Threaded reply WITH a pending MCP session — forward to session.
         if thread_ts:
@@ -110,11 +114,27 @@ class SlackDaemon:
                     writer.close()
                 return
 
-        # Case 2: Threaded reply with NO pending session.
+        # Case 2: Threaded reply with NO pending session. Only engage threads the
+        # bot actually BELONGS to — an @-mention in this reply, or a thread it was
+        # invited into / has posted in. Otherwise stay out of humans' own threads
+        # (the bug: previously ANY thread reply spawned a run, so the bot chimed
+        # into colleagues' conversations it was never tagged in).
         if thread_ts:
+            if not (mentioned or thread_ts in self._bot_threads):
+                if thread_ts in self._non_bot_threads:
+                    return  # already classified as a human-only thread
+                if not await self._is_bot_thread(channel, thread_ts):
+                    self._non_bot_threads.add(thread_ts)
+                    logger.info("Ignoring reply in non-bot thread %s.", thread_ts)
+                    return
+            # Engaged — remember this is a bot thread so later replies continue it
+            # without a re-mention (collaborative: anyone may pick it up).
+            self._bot_threads.add(thread_ts)
+            self._non_bot_threads.discard(thread_ts)
+            if mentioned:
+                text = text.replace(mention_tag, "").strip()
             if thread_ts in self._active_threads:
-                # A run is in flight — interrupt (hard) or queue (soft) instead of
-                # silently dropping the message.
+                # A run is in flight — interrupt (hard) or queue (soft).
                 await self._handle_busy(channel, thread_ts, text)
                 return
             self._active_threads.add(thread_ts)  # claim synchronously (close the race)
@@ -122,14 +142,14 @@ class SlackDaemon:
             return
 
         # Case 3: Top-level message — only respond if the bot is mentioned.
-        mention_tag = f"<@{self._bot_user_id}>"
-        if mention_tag not in text:
+        if not mentioned:
             return
 
         # Strip the mention from the text so Claude sees clean input.
         text = text.replace(mention_tag, "").strip()
 
         message_ts: str = event.get("ts", "")
+        self._bot_threads.add(message_ts)  # this @-mention opens a bot thread
         if message_ts in self._active_threads:
             await self._handle_busy(channel, message_ts, text)
             return
@@ -155,6 +175,27 @@ class SlackDaemon:
 
         # Delegate to the normal message handler for authorized mentions.
         await self._handle_slack_message(event)
+
+    async def _is_bot_thread(self, channel: str, thread_ts: str) -> bool:
+        """Is this a thread the bot belongs to? True if its parent (or any message)
+        @-mentions the bot, or the bot has posted in it. Used once per first-seen
+        thread to decide whether to engage; the result is cached by the caller.
+        On API failure we return False — better to stay quiet than barge into a
+        human thread."""
+        try:
+            resp = await self._app.client.conversations_replies(
+                channel=channel, ts=thread_ts, limit=100)
+            messages = resp.get("messages", []) or []
+        except Exception as exc:
+            logger.warning("Could not classify thread %s (%s) — staying out.", thread_ts, exc)
+            return False
+        mention = f"<@{self._bot_user_id}>"
+        for m in messages:
+            if m.get("user") == self._bot_user_id:
+                return True  # the bot has posted here
+            if mention in (m.get("text") or ""):
+                return True  # someone tagged the bot in this thread
+        return False
 
     def _make_reporter(self, channel: str, thread_ts: str, user_id: str) -> Any:
         """Build a live-progress reporter for one Flow-B run (see slack_progress)."""
