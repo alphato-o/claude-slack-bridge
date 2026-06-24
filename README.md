@@ -41,6 +41,22 @@ Claude Code  ──ask_on_slack──▶  Slack channel  ──your reply──�
 
 ---
 
+## Real-world use cases
+
+Patterns already running in production (details neutralized):
+
+> **🛒 E-commerce ops, away from the desk.** Someone drops `@claude assess the fraud risk on this order <link>` in the channel; it reads the order, the customer history, and the team's risk playbook, then gives a ship/hold call right in the thread — no laptop needed. Same channel handles "how did order volume this week compare to last?" by pulling live store data.
+
+> **🤖 Closing the loop on a support bot.** A team maintains a customer-support assistant (RAG over their docs). When it answers something wrong, they just say `@claude the bot quoted the wrong price — learn the real numbers from our site, fix the prompt, run the regression battery, and ship it`. It edits the prompt, runs ~100 test cases, deploys to staging, and posts the pass/fail tally back to the thread — picking the task up across several messages without losing context.
+
+> **📈 A 24/7 autopilot that reports to you.** An unattended campaign loop runs around the clock and mirrors each cycle's outcome to Slack — what it did, what landed — so nobody babysits a terminal. The team `@mention`s to retune the strategy and it folds the change into the next cycle.
+
+> **🛠️ Software it builds itself.** Maintainers develop projects from the project's own Slack channel — tag it with a change, watch it stream the edits and run the test suite live, and it reports back when the long run finishes. (This very bridge is developed that way.)
+
+What ties these together: **one shared Claude per channel** that anyone can hand off to, that **remembers** the project between tasks, **streams** what it's doing, and brings **long-running results home** to the right thread.
+
+---
+
 ## Quickstart — Claude → Slack
 
 ### 1. Create a Slack app and get tokens
@@ -177,6 +193,10 @@ The bot lists your open tasks (from Notion, Linear, Jira, …), creates a git wo
 
 ---
 
+## Credits
+
+Built on the original **[claude-slack-bridge](https://github.com/tomeraitz/claude-slack-bridge)** by **[@tomeraitz](https://github.com/tomeraitz)** — thank you for the foundation (the daemon + session model, `ask_on_slack`, and the project bot). MIT-licensed, so this is a friendly fork: it adds the live native streaming, per-channel continuity, shared/unified memory, soft+hard interrupts, async-results-home, and the "self-hosted Claude Tag" framing on top.
+
 ## License
 
-MIT
+MIT — same as upstream. See [LICENSE](LICENSE).
