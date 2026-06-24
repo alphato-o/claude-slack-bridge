@@ -28,6 +28,12 @@ services:
       # conversation history — without this, every rebuild forces Claude to
       # re-explore from scratch.
       - claude-home:/home/appuser/.claude
+      # UNIFY MEMORY: overlay the EMM project's memory dir with the host terminal
+      # session's memory (read-write), so the Slack-bridge me and the terminal me
+      # share ONE memory store — write a memory either side, the other sees it.
+      # Surgical: only the memory subdir, not the whole .claude (transcripts stay
+      # per-runtime in the named volume above).
+      - ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-emmshopify/memory:/home/appuser/.claude/projects/-projects-emmshopify/memory
     restart: unless-stopped
 
 volumes:
