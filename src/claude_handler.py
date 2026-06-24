@@ -187,6 +187,29 @@ def _append_journal(cwd_key: str, request: str, result: str) -> None:
         logger.debug("journal append failed: %s", exc)
 
 
+def _memory_addendum(project_dir: str | None) -> str:
+    """System-prompt addendum pointing Claude at this project's shared, file-based
+    memory. Headless ``claude -p`` does NOT auto-recall memory and the container
+    has no global memory instructions, so we must tell it explicitly — and the
+    memory dir is bind-mounted to share one store with Alpha's terminal Claude."""
+    if not project_dir:
+        return ""
+    mem = f"/home/appuser/.claude/projects/{project_dir.replace('/', '-')}/memory"
+    return (
+        f" SHARED MEMORY — this project has a persistent, file-based memory at "
+        f"`{mem}/`, SHARED with Alpha's terminal Claude (you both read AND write "
+        f"the same store). BEFORE assuming you don't know this project, read "
+        f"`{mem}/MEMORY.md` if it exists (a one-line index of saved facts) and open "
+        f"any listed file relevant to the request. When you learn a durable, "
+        f"reusable fact (how something works, a decision, a gotcha — not a one-off), "
+        f"SAVE it: write `{mem}/<short-slug>.md` with YAML frontmatter (name, "
+        f"description, metadata.type: project|feedback|reference) then the fact, and "
+        f"add a one-line pointer in `{mem}/MEMORY.md`. Update/dedupe rather than "
+        f"duplicate. This is how continuity persists across sessions and between "
+        f"Slack and the terminal — check it early, keep it current."
+    )
+
+
 def _anchor_addendum(channel: str, thread_ts: str) -> str:
     """System-prompt addendum telling Claude its Slack location anchor, and how a
     job that outlives the turn can post its result back to THIS thread."""
@@ -284,9 +307,14 @@ class ClaudeHandler:
             _save_sessions(self._session)
             return "🆕 Started a fresh conversation for this project. What would you like me to do?"
 
-        # Tell Claude its Slack anchor so any work that outlives this turn can
-        # report back to THIS thread (token-safely, via bridge_notify).
-        system_prompt = self._FLOW_B_SYSTEM_PROMPT + _anchor_addendum(channel, thread_ts)
+        # Tell Claude its Slack anchor (so out-of-turn work reports back here) and
+        # to consult/maintain the project's shared file-based memory (headless
+        # claude -p won't auto-recall it).
+        system_prompt = (
+            self._FLOW_B_SYSTEM_PROMPT
+            + _anchor_addendum(channel, thread_ts)
+            + _memory_addendum(project_dir)
+        )
 
         session_id, resume = self._session_for(cwd_key, project_dir, force_new)
         prompt = text

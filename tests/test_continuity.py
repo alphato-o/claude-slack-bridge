@@ -58,6 +58,16 @@ class TestJournal:
         assert claude_handler._journal_tail("/projects/none") == ""
 
 
+class TestMemoryAddendum:
+    def test_points_at_the_shared_cwd_memory_dir(self):
+        a = claude_handler._memory_addendum("/projects/RoxImproved")
+        assert "/home/appuser/.claude/projects/-projects-RoxImproved/memory" in a
+        assert "MEMORY.md" in a and "SHARED" in a
+
+    def test_empty_when_no_project_dir(self):
+        assert claude_handler._memory_addendum(None) == ""
+
+
 class TestNewCommand:
     def test_bare_new_resets_and_acks(self, tmp_path, monkeypatch):
         _patch_paths(tmp_path, monkeypatch)
