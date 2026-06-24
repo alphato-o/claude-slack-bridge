@@ -40,6 +40,18 @@ curated `MEMORY.md` + memory files, not raw chat logs.)
    docker exec claude-slack-bridge cat /home/appuser/.claude/projects/-projects-<P>/memory/.probe
    ```
 
+## Two halves — the mount AND the instruction
+
+The bind-mount only makes the files *available*. Headless `claude -p` does **not**
+auto-recall memory (it answered "NO MEMORY IN CONTEXT" even with the files mounted),
+and the container has no global memory instructions. So the bridge also **tells**
+each run to use it: `claude_handler._memory_addendum(project_dir)` injects a
+per-cwd directive into the Flow-B system prompt pointing at
+`~/.claude/projects/-projects-<P>/memory/MEMORY.md`, instructing Claude to read it
+before assuming ignorance and to record durable facts there. Both halves ship
+together — a new project gets the mount (here) and the directive (automatic, since
+it's computed from the run's cwd).
+
 ## The slug rule
 
 The path component is the absolute cwd with every `/` replaced by `-`:
