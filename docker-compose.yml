@@ -34,6 +34,14 @@ services:
       # Surgical: only the memory subdir, not the whole .claude (transcripts stay
       # per-runtime in the named volume above).
       - ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-emmshopify/memory:/home/appuser/.claude/projects/-projects-emmshopify/memory
+      # Same unified memory for the other configured bridges. Pattern for a NEW
+      # project P (host ~/Dev/ccplayground/P → container /projects/P):
+      #   ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-P/memory
+      #     :/home/appuser/.claude/projects/-projects-P/memory
+      # (mkdir -p the host side first if the CLI has never run there.) See
+      # docs/memory-unification.md.
+      - ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-RoxImproved/memory:/home/appuser/.claude/projects/-projects-RoxImproved/memory
+      - ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-phicampaign/memory:/home/appuser/.claude/projects/-projects-phicampaign/memory
     restart: unless-stopped
 
 volumes:
