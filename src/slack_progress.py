@@ -725,6 +725,15 @@ class FallbackReporter(ProgressReporter):
             await self._inner.start()
         except Exception:
             await self._switch()
+            return
+        # The base start() deliberately SWALLOWS _open() failures (a flaky open
+        # shouldn't crash a run), so a native stream can fail to open WITHOUT
+        # raising — e.g. chat.startStream is rejected for a Slack Connect
+        # (external-workspace) recipient. Detect the un-opened stream and fall
+        # back to chat.update, otherwise the whole run posts nothing.
+        if getattr(self._inner, "_stream_ts", "ok") is None:
+            logger.info("native stream did not open — falling back to chat.update")
+            await self._switch()
 
     async def on_event(self, event: dict[str, Any]) -> None:
         try:

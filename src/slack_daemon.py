@@ -78,6 +78,10 @@ class SlackDaemon:
 
         user_id: str = event.get("user", "")
         channel: str = event.get("channel", "")
+        # The author's HOME team (their own workspace for a Slack Connect user),
+        # used as the streaming recipient's team. Slack puts it in user_team /
+        # source_team on shared-channel events; falls back to the event team.
+        user_team: str = event.get("user_team") or event.get("source_team") or event.get("team", "")
 
         # Access control: reject unauthorized users/channels before any processing.
         if not self._access_control.is_allowed(user_id=user_id, channel_id=channel):
@@ -138,7 +142,8 @@ class SlackDaemon:
                 await self._handle_busy(channel, thread_ts, text)
                 return
             self._active_threads.add(thread_ts)  # claim synchronously (close the race)
-            asyncio.create_task(self._run_turn(channel, thread_ts, text, user_id, is_new=False))
+            asyncio.create_task(self._run_turn(
+                channel, thread_ts, text, user_id, is_new=False, user_team=user_team))
             return
 
         # Case 3: Top-level message — only respond if the bot is mentioned.
@@ -154,7 +159,8 @@ class SlackDaemon:
             await self._handle_busy(channel, message_ts, text)
             return
         self._active_threads.add(message_ts)
-        asyncio.create_task(self._run_turn(channel, message_ts, text, user_id, is_new=True))
+        asyncio.create_task(self._run_turn(
+            channel, message_ts, text, user_id, is_new=True, user_team=user_team))
 
     async def _handle_app_mention(self, event: dict[str, Any]) -> None:
         """Handle app_mention events (bot @mentioned in any channel)."""
@@ -197,16 +203,23 @@ class SlackDaemon:
                 return True  # someone tagged the bot in this thread
         return False
 
-    def _make_reporter(self, channel: str, thread_ts: str, user_id: str) -> Any:
-        """Build a live-progress reporter for one Flow-B run (see slack_progress)."""
+    def _make_reporter(
+        self, channel: str, thread_ts: str, user_id: str, user_team: str = ""
+    ) -> Any:
+        """Build a live-progress reporter for one Flow-B run (see slack_progress).
+
+        The streaming recipient must be the user who triggered the run — including
+        their HOME team. For a Slack Connect (external-workspace) user that's their
+        team, not the bot's; passing the bot's team makes chat.startStream reject
+        the recipient (then we fall back to chat.update)."""
         return make_reporter(
             self._app.client, channel, thread_ts,
-            user_id=user_id, team_id=self._claude._team_id,
+            user_id=user_id, team_id=user_team or self._claude._team_id,
         )
 
     async def _run_turn(
         self, channel: str, thread_ts: str, text: str,
-        user_id: str = "", is_new: bool = False,
+        user_id: str = "", is_new: bool = False, user_team: str = "",
     ) -> None:
         """Run one Claude turn for *thread_ts*, tracked so it can be interrupted.
 
@@ -216,7 +229,7 @@ class SlackDaemon:
         """
         self._active_threads.add(thread_ts)
         self._run_tasks[thread_ts] = asyncio.current_task()  # type: ignore[assignment]
-        reporter = self._make_reporter(channel, thread_ts, user_id)
+        reporter = self._make_reporter(channel, thread_ts, user_id, user_team)
         try:
             await reporter.start()
             response = await self._claude.handle_turn(channel, thread_ts, text, reporter)
@@ -243,8 +256,8 @@ class SlackDaemon:
                 combined = "\n\n".join(queued)
                 logger.info("Draining %d queued msg(s) on %s as the next turn.", len(queued), thread_ts)
                 self._active_threads.add(thread_ts)  # claim before the await gap
-                asyncio.create_task(
-                    self._run_turn(channel, thread_ts, combined, user_id, is_new=False))
+                asyncio.create_task(self._run_turn(
+                    channel, thread_ts, combined, user_id, is_new=False, user_team=user_team))
 
     async def _handle_busy(self, channel: str, thread_ts: str, text: str) -> None:
         """A message arrived while a run is in flight: hard-interrupt (kill the

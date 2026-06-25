@@ -358,6 +358,31 @@ class TestFactory:
         assert client.named("postMessage")[-1]["markdown_text"] == "answer"
         assert not client.named("update")  # no live edits in off mode
 
+    def test_falls_back_when_native_stream_fails_to_open(self):
+        # Slack Connect bug: chat.startStream is rejected for an external-workspace
+        # recipient; base start() swallows it, so the auto reporter must still
+        # detect the un-opened stream and fall back to chat.update (else the whole
+        # run posts nothing).
+        client = FakeAsyncClient()
+
+        async def boom(**kwargs):
+            raise RuntimeError("invalid_recipient")
+
+        client.chat_startStream = boom  # startStream always fails
+        rep = make_reporter(client, "C1", "100.0", mode="auto",
+                            user_id="U1", team_id="T_EXTERNAL")
+
+        async def go():
+            await rep.start()
+            await rep.on_event(_assistant({"type": "text", "text": "hello there"}))
+            await rep.finish("the answer")
+
+        asyncio.run(go())
+        # ChatUpdateReporter took over: a placeholder was posted, and the final
+        # answer landed via chat.update (markdown_text).
+        assert client.named("postMessage"), "fallback placeholder should be posted"
+        assert any("the answer" in u.get("markdown_text", "") for u in client.named("update"))
+
     def test_mode_selection(self):
         c = FakeAsyncClient()
         from slack_progress import FallbackReporter, _NullReporter
