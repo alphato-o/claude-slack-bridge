@@ -79,15 +79,14 @@ class BrainExecutor:
             except Exception as exc:
                 logger.debug("ack reaction failed: %s", exc)
 
-        # 1a) OPEN A STREAM NOW — Slack shimmers the "Dario" title while a stream is open,
-        #     so opening it immediately (and holding it through the think) gives the live
-        #     "is working" animation, like the official Claude app. A keep-alive holds it
-        #     open across a long think. Fallback: a static "thinking…" placeholder.
-        stream_ts = placeholder_ts = keepalive = None
-        if STREAM_REVEAL:
-            stream_ts = await self._open_stream(channel, anchor_ts, user)
-        if stream_ts:
-            keepalive = asyncio.ensure_future(self._keepalive(channel, stream_ts))
+        # 1a) SHIMMER — assistant.threads.setStatus animates the "Dario" title in theme
+        #     colour ("is working"). Set it now, refresh it through the think, clear on
+        #     reply. This is the actual title-shimmer (separate from text streaming).
+        #     If setStatus is unavailable, fall back to a static "🧠 thinking…" placeholder.
+        placeholder_ts = shimmer = None
+        status_ok = await self._set_status(channel, anchor_ts, "🧠 Dario is thinking…")
+        if status_ok:
+            shimmer = asyncio.ensure_future(self._shimmer(channel, anchor_ts))
         else:
             try:
                 r = await self._client.chat_postMessage(
@@ -130,52 +129,50 @@ class BrainExecutor:
             logger.warning("brain-mode: timeout awaiting reply for %s", evt_id)
             out = "⏳ Still working on this one — I'll follow up in this thread when it's done."
 
-        if keepalive:
-            keepalive.cancel()
-        await self._finish(channel, anchor_ts, stream_ts, placeholder_ts, message_ts, out)
+        if shimmer:
+            shimmer.cancel()
+        await self._clear_status(channel, anchor_ts)       # stop the title shimmer
+        await self._finish(channel, anchor_ts, placeholder_ts, message_ts, user, out)
         return ""
 
-    async def _open_stream(self, channel, thread_ts, user):
-        """Start a stream (title shimmers while open). Returns its ts, or None on failure."""
+    async def _set_status(self, channel, thread_ts, status: str) -> bool:
+        """Set the animated 'is working' status on the app title (the shimmer). Returns
+        True if the API accepted it (i.e. the shimmer is showing)."""
         try:
-            kw = dict(channel=channel, thread_ts=thread_ts)
-            if user and self._team_id:
-                kw["recipient_user_id"] = user
-                kw["recipient_team_id"] = self._team_id
-            resp = await self._client.chat_startStream(**kw)
-            return resp["ts"]
+            r = await self._client.assistant_threads_setStatus(
+                channel_id=channel, thread_ts=thread_ts, status=status)
+            return bool(r.get("ok"))
         except Exception as exc:
-            logger.debug("startStream failed (%s) — falling back to placeholder", exc)
-            return None
+            logger.debug("setStatus unavailable (%s) — using placeholder", exc)
+            return False
 
-    async def _keepalive(self, channel, stream_ts):
-        """Keep an open stream alive during a long think by appending an invisible
-        zero-width space every few seconds (holds the shimmer without visible content)."""
+    async def _clear_status(self, channel, thread_ts) -> None:
+        try:
+            await self._client.assistant_threads_setStatus(
+                channel_id=channel, thread_ts=thread_ts, status="")
+        except Exception:
+            pass
+
+    async def _shimmer(self, channel, thread_ts):
+        """Refresh the status periodically so the shimmer holds through a long think."""
         try:
             while True:
-                await asyncio.sleep(7)
-                await self._client.chat_appendStream(
-                    channel=channel, ts=stream_ts,
-                    chunks=[{"type": "markdown_text", "text": "​"}])
+                await asyncio.sleep(9)
+                await self._client.assistant_threads_setStatus(
+                    channel_id=channel, thread_ts=thread_ts, status="🧠 Dario is thinking…")
         except asyncio.CancelledError:
             return
         except Exception as exc:
-            logger.debug("keepalive stopped: %s", exc)
+            logger.debug("shimmer refresh stopped: %s", exc)
 
-    async def _finish(self, channel, thread_ts, stream_ts, placeholder_ts, message_ts, out: str) -> None:
-        """Reveal the brain's reply.
-        - "__posted__" → brain posted a rich message itself; close/remove the working indicator.
-        - "" (empty)   → no reply; remove the working indicator.
-        - any text     → stream it into the open stream (animated), or morph the placeholder.
-        Then a ✅ done reaction on the user's message.
+    async def _finish(self, channel, thread_ts, placeholder_ts, message_ts, user, out: str) -> None:
+        """Reveal the brain's reply — text streams in (chat.appendStream animation), or
+        morph the fallback placeholder. Then a ✅ done reaction.
+        - "__posted__" → brain posted a rich message itself; remove any placeholder.
+        - "" (empty)   → no reply; remove any placeholder.
         """
         stripped = out.strip()
         if stripped in ("", "__posted__"):
-            if stream_ts:                                  # close the empty holding-stream
-                try: await self._client.chat_stopStream(channel=channel, ts=stream_ts)
-                except Exception: pass
-                try: await self._client.chat_delete(channel=channel, ts=stream_ts)
-                except Exception: pass
             if placeholder_ts:
                 try: await self._client.chat_delete(channel=channel, ts=placeholder_ts)
                 except Exception as exc: logger.debug("placeholder delete failed: %s", exc)
@@ -183,28 +180,39 @@ class BrainExecutor:
                 await self._done_react(channel, message_ts)
             return
 
-        if stream_ts:                                      # animate the answer into the stream
-            try:
-                for chunk in _chunks(out):
-                    await self._client.chat_appendStream(
-                        channel=channel, ts=stream_ts,
-                        chunks=[{"type": "markdown_text", "text": chunk}])
-                await self._client.chat_stopStream(channel=channel, ts=stream_ts)
-            except Exception as exc:
-                logger.debug("stream append/stop failed (%s) — posting fresh", exc)
-                try: await self._client.chat_stopStream(channel=channel, ts=stream_ts)
-                except Exception: pass
+        # animate the answer with a streamed reveal (text appears); morph placeholder on fallback
+        streamed = False
+        if STREAM_REVEAL and not placeholder_ts:
+            streamed = await self._stream_reveal(channel, thread_ts, user, out)
+        if not streamed:
+            if placeholder_ts:
+                try:
+                    await self._client.chat_update(channel=channel, ts=placeholder_ts, text=out)
+                except Exception as exc:
+                    logger.debug("placeholder update failed (%s) — posting fresh", exc)
+                    await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=out)
+            else:
                 await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=out)
-        elif placeholder_ts:                               # fallback: morph the placeholder
-            try:
-                await self._client.chat_update(channel=channel, ts=placeholder_ts, text=out)
-            except Exception as exc:
-                logger.debug("placeholder update failed (%s) — posting fresh", exc)
-                await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=out)
-        else:
-            await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=out)
         if message_ts:
             await self._done_react(channel, message_ts)
+
+    async def _stream_reveal(self, channel, thread_ts, user, out: str) -> bool:
+        """Stream the answer text in (the 'text appearing' animation). Returns True on success."""
+        try:
+            kw = dict(channel=channel, thread_ts=thread_ts)
+            if user and self._team_id:
+                kw["recipient_user_id"] = user
+                kw["recipient_team_id"] = self._team_id
+            stream_ts = (await self._client.chat_startStream(**kw))["ts"]
+            for chunk in _chunks(out):
+                await self._client.chat_appendStream(
+                    channel=channel, ts=stream_ts,
+                    chunks=[{"type": "markdown_text", "text": chunk}])
+            await self._client.chat_stopStream(channel=channel, ts=stream_ts)
+            return True
+        except Exception as exc:
+            logger.debug("stream reveal failed (%s) — will post fresh", exc)
+            return False
 
     async def _done_react(self, channel, message_ts) -> None:
         try:
