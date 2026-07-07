@@ -374,7 +374,7 @@ class ClaudeHandler:
         """Lazily construct the BrainExecutor (only when a brain-mode channel is hit)."""
         if self._brain is None:
             from brain_executor import BrainExecutor
-            self._brain = BrainExecutor(self._slack_client)
+            self._brain = BrainExecutor(self._slack_client, team_id=self._team_id)
         return self._brain
 
     def _lock_for(self, cwd_key: str) -> asyncio.Lock:

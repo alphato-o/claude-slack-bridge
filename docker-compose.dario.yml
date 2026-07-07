@@ -8,6 +8,7 @@ services:
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
       - DEFAULT_MODE=brain
       - BRAIN_DIR=/brain
+      - SLACK_TEAM_ID=${SLACK_TEAM_ID}
     volumes:
       - ${HOME}/.claude:/host-claude:ro
       - /Users/fydeos/Dev/ccplayground:/projects

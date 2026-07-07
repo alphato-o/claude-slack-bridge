@@ -36,13 +36,29 @@ ACK_EMOJI = os.getenv("BRAIN_ACK_EMOJI", "eyes")
 REPLY_TIMEOUT = int(os.getenv("BRAIN_REPLY_TIMEOUT", "600"))   # seconds to await the brain
 POLL = 0.4
 BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
+# Animate the reply via Slack's streaming API (native 'text appearing' effect). On by default.
+STREAM_REVEAL = os.getenv("BRAIN_STREAM_REVEAL", "true").lower() == "true"
+CHUNK_CHARS = int(os.getenv("BRAIN_STREAM_CHUNK", "28"))       # ~chars per animated append
+
+
+def _chunks(text: str):
+    """Split text into streaming chunks at word boundaries (~CHUNK_CHARS each) so the
+    reveal animates smoothly without one giant append or hundreds of tiny ones."""
+    words, buf, n = text.split(" "), [], 0
+    for w in words:
+        buf.append(w); n += len(w) + 1
+        if n >= CHUNK_CHARS:
+            yield " ".join(buf) + " "; buf, n = [], 0
+    if buf:
+        yield " ".join(buf)
 
 
 class BrainExecutor:
     """Routes a Slack turn to the single standing Dario brain via a host inbox/outbox."""
 
-    def __init__(self, slack_client: Any) -> None:
+    def __init__(self, slack_client: Any, team_id: str = "") -> None:
         self._client = slack_client
+        self._team_id = team_id or os.getenv("SLACK_TEAM_ID", "")
         (BRAIN_DIR / "inbox").mkdir(parents=True, exist_ok=True)
         (BRAIN_DIR / "outbox").mkdir(parents=True, exist_ok=True)
 
@@ -100,35 +116,84 @@ class BrainExecutor:
                 try: reply_f.unlink()
                 except FileNotFoundError: pass
                 logger.info("brain-mode: got reply for %s (%d chars)", evt_id, len(out))
-                await self._finish(channel, placeholder_ts, message_ts, out)
+                await self._finish(channel, anchor_ts, placeholder_ts, message_ts, user, out)
                 return ""
             await asyncio.sleep(POLL)
 
         logger.warning("brain-mode: timeout awaiting reply for %s", evt_id)
-        await self._finish(channel, placeholder_ts, message_ts,
+        await self._finish(channel, anchor_ts, placeholder_ts, message_ts, user,
                            "⏳ Still working on this one — I'll follow up in this thread when it's done.")
         return ""
 
-    async def _finish(self, channel, placeholder_ts, message_ts, out: str) -> None:
+    async def _finish(self, channel, thread_ts, placeholder_ts, message_ts, user, out: str) -> None:
         """Resolve the placeholder based on the brain's outbox reply.
         - "__posted__"  → brain already posted a rich message itself; remove the placeholder.
         - "" (empty)    → no reply; remove the placeholder.
-        - any text      → edit the placeholder INTO that text (the morph) + ✅ done reaction.
+        - any text      → reveal it. If STREAM_REVEAL, animate via Slack's streaming API
+          (native cursor + smooth text-appearing, like the official app); else edit the
+          placeholder in place (the morph). Then ✅ done reaction.
         """
         stripped = out.strip()
         if stripped in ("", "__posted__"):
             if placeholder_ts:
                 try: await self._client.chat_delete(channel=channel, ts=placeholder_ts)
                 except Exception as exc: logger.debug("placeholder delete failed: %s", exc)
-        else:
+            if message_ts and stripped == "__posted__":
+                await self._done_react(channel, message_ts)
+            return
+
+        revealed = False
+        if STREAM_REVEAL:
+            revealed = await self._stream_reveal(channel, thread_ts, placeholder_ts, user, out)
+        if not revealed:                                   # fallback: single in-place morph
             if placeholder_ts:
                 try:
                     await self._client.chat_update(channel=channel, ts=placeholder_ts, text=out)
                 except Exception as exc:
                     logger.debug("placeholder update failed (%s) — posting fresh", exc)
-                    await self._client.chat_postMessage(channel=channel, text=out)
+                    await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=out)
             else:
-                await self._client.chat_postMessage(channel=channel, text=out)
+                await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=out)
+        if message_ts:
+            await self._done_react(channel, message_ts)
+
+    async def _stream_reveal(self, channel, thread_ts, placeholder_ts, user, out: str) -> bool:
+        """Animate the reply using Slack's streaming API — the native 'text appearing'
+        effect. Content is pre-computed (brain mode has no live token stream), but the
+        animation matches the official Claude app. Returns True on success."""
+        # The stream is a NEW message, so drop the static placeholder first.
+        if placeholder_ts:
+            try: await self._client.chat_delete(channel=channel, ts=placeholder_ts)
+            except Exception: pass
+        try:
+            kw = dict(channel=channel, thread_ts=thread_ts)
+            if user and self._team_id:
+                kw["recipient_user_id"] = user
+                kw["recipient_team_id"] = self._team_id
+            resp = await self._client.chat_startStream(**kw)
+            stream_ts = resp["ts"]
+        except Exception as exc:
+            logger.debug("startStream failed (%s) — will fall back to morph", exc)
+            return False
+        try:
+            for chunk in _chunks(out):
+                await self._client.chat_appendStream(
+                    channel=channel, ts=stream_ts,
+                    chunks=[{"type": "markdown_text", "text": chunk}])
+            await self._client.chat_stopStream(channel=channel, ts=stream_ts)
+            return True
+        except Exception as exc:
+            logger.debug("stream append/stop failed (%s)", exc)
+            try: await self._client.chat_stopStream(channel=channel, ts=stream_ts)
+            except Exception: pass
+            return False
+
+    async def _done_react(self, channel, message_ts) -> None:
+        try:
+            await self._client.reactions_add(
+                channel=channel, timestamp=message_ts, name="white_check_mark")
+        except Exception as exc:
+            logger.debug("done reaction failed: %s", exc)
         # ✅ done signal on the user's message (in addition to the 👀 ack)
         if message_ts and stripped not in ("",):
             try:
