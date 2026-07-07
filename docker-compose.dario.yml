@@ -6,7 +6,7 @@ services:
     environment:
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
       - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
-      - DEFAULT_MODE=session
+      - DEFAULT_MODE=brain
       - BRAIN_DIR=/brain
     volumes:
       - ${HOME}/.claude:/host-claude:ro

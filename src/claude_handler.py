@@ -246,6 +246,9 @@ class ClaudeHandler:
         # mode:brain support — a single standing brain instead of per-channel claude -p.
         # Lazily constructed so `session`-only deployments (e.g. Bran) never touch it.
         self._default_mode: str = os.getenv("DEFAULT_MODE", "session").lower()
+        # When DEFAULT_MODE=brain, ANY channel Dario is in routes to the brain with no
+        # projects.json entry — so a newly-invited channel "just works" (no re-config).
+        self._brain_default_path: str = os.getenv("BRAIN_DEFAULT_PATH", "")
         self._brain: Any = None
         # Resolved at startup: channel ID → {"path": str|None, "plugin_dir": str|None,
         #                                    "worktrees": dict[str, str]}
@@ -413,6 +416,10 @@ class ClaudeHandler:
         """
         config = self._channel_id_to_project.get(channel_id)
         if not config:
+            # Unmapped channel: in brain-default mode, route to the brain's project dir so
+            # a newly-invited channel works with zero config. Otherwise default cwd.
+            if self._default_mode == "brain" and self._brain_default_path:
+                return self._brain_default_path, None
             logger.info("No project mapping for channel %s — using default cwd.", channel_id)
             return None, None
 

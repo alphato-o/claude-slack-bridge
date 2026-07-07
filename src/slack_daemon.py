@@ -60,6 +60,7 @@ class SlackDaemon:
         self._access_control = AccessControl(SecurityConfig.from_env())
         self._app.event("message")(self._handle_slack_message)
         self._app.event("app_mention")(self._handle_app_mention)
+        self._app.event("member_joined_channel")(self._handle_member_joined)
 
     async def _handle_slack_message(self, event: dict[str, Any]) -> None:
         # Filter: Ignore bot messages (prevents self-echo loops).
@@ -175,6 +176,23 @@ class SlackDaemon:
         asyncio.create_task(self._run_turn(
             channel, message_ts, text, user_id, is_new=True, user_team=user_team,
             files=event.get("files")))
+
+    async def _handle_member_joined(self, event: dict[str, Any]) -> None:
+        """When DARIO himself is added to a channel, it auto-works (brain-default mode
+        needs no per-channel config) — we just log it and drop a one-time hello so the
+        team knows he's live there. No projects.json edit, no restart, no re-discovery."""
+        if event.get("user") != self._bot_user_id:
+            return  # someone else joined — ignore
+        channel = event.get("channel", "")
+        logger.info("Dario was added to channel %s — auto-active (brain-default).", channel)
+        try:
+            await self._app.client.chat_postMessage(
+                channel=channel,
+                text=("👋 Dario here. @mention me in this channel and I'll pick it up — "
+                      "I reply in a thread under your mention. (Casual chatter I stay out of.)"),
+            )
+        except Exception as exc:
+            logger.debug("join-hello to %s failed: %s", channel, exc)
 
     def _brain_answers_all(self, channel: str) -> bool:
         """Brain-mode channel that answers EVERY message (not just @mentions)?
