@@ -154,7 +154,7 @@ class SlackDaemon:
             self._active_threads.add(thread_ts)  # claim synchronously (close the race)
             asyncio.create_task(self._run_turn(
                 channel, thread_ts, text, user_id, is_new=False, user_team=user_team,
-                files=event.get("files")))
+                files=event.get("files"), msg_ts=event.get("ts", "")))
             return
 
         # Case 3: Top-level message — respond if @mentioned, OR if this is a brain-mode
@@ -175,7 +175,7 @@ class SlackDaemon:
         self._active_threads.add(message_ts)
         asyncio.create_task(self._run_turn(
             channel, message_ts, text, user_id, is_new=True, user_team=user_team,
-            files=event.get("files")))
+            files=event.get("files"), msg_ts=message_ts))
 
     async def _handle_member_joined(self, event: dict[str, Any]) -> None:
         """When DARIO himself is added to a channel, it auto-works (brain-default mode
@@ -262,7 +262,7 @@ class SlackDaemon:
     async def _run_turn(
         self, channel: str, thread_ts: str, text: str,
         user_id: str = "", is_new: bool = False, user_team: str = "",
-        files: list | None = None,
+        files: list | None = None, msg_ts: str = "",
     ) -> None:
         """Run one Claude turn for *thread_ts*, tracked so it can be interrupted.
 
@@ -286,7 +286,8 @@ class SlackDaemon:
                 reply = await self._claude.brain().handle_turn(
                     channel, thread_ts, text,
                     user=user_id, user_name=user_name,
-                    is_dm=channel.startswith("D"), mentioned=True, message_ts=thread_ts,
+                    is_dm=channel.startswith("D"), mentioned=True,
+                    message_ts=msg_ts or thread_ts,   # real per-message ts → unique event id
                     files=files,
                 )
                 if reply:
