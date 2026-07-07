@@ -96,6 +96,15 @@ class SlackDaemon:
                 logger.warning("Failed to send rejection message to %s: %s", channel, exc)
             return
 
+        # DM gate: Dario answers DMs ONLY from the owner. Teammate DMs are ignored —
+        # Dario's work happens in the open, in channels, not in private DMs.
+        # (owner ruling 2026-07-07). DM_OWNER_ID is the owner's Slack user id; empty
+        # env disables the gate (session deployments like Bran keep DMs open).
+        dm_owner = os.getenv("DM_OWNER_ID", "")
+        if channel.startswith("D") and dm_owner and user_id != dm_owner:
+            logger.info("Ignoring DM from non-owner %s in %s.", user_id, channel)
+            return
+
         thread_ts: str | None = event.get("thread_ts")
         text: str = event.get("text", "")
         mention_tag = f"<@{self._bot_user_id}>"
