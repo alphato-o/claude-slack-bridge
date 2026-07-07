@@ -241,6 +241,10 @@ class ClaudeHandler:
         self._bot_user_id: str = ""
         self._team_id: str = ""
         self._project_map: dict[str, Any] = _load_project_map()
+        # mode:brain support — a single standing brain instead of per-channel claude -p.
+        # Lazily constructed so `session`-only deployments (e.g. Bran) never touch it.
+        self._default_mode: str = os.getenv("DEFAULT_MODE", "session").lower()
+        self._brain: Any = None
         # Resolved at startup: channel ID → {"path": str|None, "plugin_dir": str|None,
         #                                    "worktrees": dict[str, str]}
         self._channel_id_to_project: dict[str, dict] = {}
@@ -338,6 +342,21 @@ class ClaudeHandler:
             result = await self._run_claude(cmd, prompt, cwd=project_dir, reporter=reporter)
         _append_journal(cwd_key, text, result)
         return result
+
+    def mode_for(self, channel_id: str) -> str:
+        """Resolve a channel's execution mode: 'brain' (single standing session) or
+        'session' (isolated claude -p). Reads projects.json entry, else DEFAULT_MODE."""
+        cfg = self._channel_id_to_project.get(channel_id) or self._project_map.get(channel_id)
+        if isinstance(cfg, dict):
+            return cfg.get("mode", self._default_mode).lower()
+        return self._default_mode
+
+    def brain(self) -> Any:
+        """Lazily construct the BrainExecutor (only when a brain-mode channel is hit)."""
+        if self._brain is None:
+            from brain_executor import BrainExecutor
+            self._brain = BrainExecutor(self._slack_client)
+        return self._brain
 
     def _lock_for(self, cwd_key: str) -> asyncio.Lock:
         lock = self._cwd_locks.get(cwd_key)

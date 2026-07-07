@@ -1,0 +1,20 @@
+services:
+  dario-slack-bridge:
+    container_name: dario-slack-bridge
+    build: .
+    env_file: [.env]
+    environment:
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+      - DEFAULT_MODE=session
+      - BRAIN_DIR=/brain
+    volumes:
+      - ${HOME}/.claude:/host-claude:ro
+      - /Users/fydeos/Dev/ccplayground:/projects
+      - ./projects.json:/app/projects.json
+      - dario-claude-home:/home/appuser/.claude
+      # the brain handoff: inbox/outbox shared with the native Dario session
+      - /Users/fydeos/Dev/ccplayground/projectDario/dario/slack:/brain
+    restart: unless-stopped
+volumes:
+  dario-claude-home:

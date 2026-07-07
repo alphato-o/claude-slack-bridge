@@ -146,9 +146,12 @@ class SlackDaemon:
                 channel, thread_ts, text, user_id, is_new=False, user_team=user_team))
             return
 
-        # Case 3: Top-level message — only respond if the bot is mentioned.
+        # Case 3: Top-level message — respond if @mentioned, OR if this is a brain-mode
+        # channel/DM (a dedicated Dario surface where every message is for the bot).
         if not mentioned:
-            return
+            _m = self._claude.mode_for(channel)
+            if not (_m == "brain" and (channel.startswith("D") or self._brain_answers_all(channel))):
+                return
 
         # Strip the mention from the text so Claude sees clean input.
         text = text.replace(mention_tag, "").strip()
@@ -161,6 +164,15 @@ class SlackDaemon:
         self._active_threads.add(message_ts)
         asyncio.create_task(self._run_turn(
             channel, message_ts, text, user_id, is_new=True, user_team=user_team))
+
+    def _brain_answers_all(self, channel: str) -> bool:
+        """Brain-mode channel that answers EVERY message (not just @mentions)?
+        Controlled per-channel by projects.json ``"answer_all": true`` (default true
+        for brain channels — they're dedicated Dario surfaces)."""
+        cfg = self._claude._channel_id_to_project.get(channel) or self._claude._project_map.get(channel)
+        if isinstance(cfg, dict):
+            return cfg.get("answer_all", True)
+        return True
 
     async def _handle_app_mention(self, event: dict[str, Any]) -> None:
         """Handle app_mention events (bot @mentioned in any channel)."""
@@ -227,6 +239,36 @@ class SlackDaemon:
         interrupts, or the instruction that followed a hard stop) are drained as
         the next turn — so nothing a user sends mid-task is ever lost.
         """
+        # mode:brain — route to the single standing brain instead of an isolated claude -p.
+        # No streaming reporter (nothing to tee); the brain acks + posts its own reply.
+        if self._claude.mode_for(channel) == "brain":
+            self._active_threads.add(thread_ts)
+            self._run_tasks[thread_ts] = asyncio.current_task()  # type: ignore[assignment]
+            try:
+                user_name = ""
+                try:
+                    info = await self._app.client.users_info(user=user_id)
+                    u = info.get("user", {})
+                    user_name = u.get("real_name") or u.get("name", "")
+                except Exception:
+                    pass
+                reply = await self._claude.brain().handle_turn(
+                    channel, thread_ts, text,
+                    user=user_id, user_name=user_name,
+                    is_dm=channel.startswith("D"), mentioned=True, message_ts=thread_ts,
+                )
+                if reply:
+                    await self._app.client.chat_postMessage(
+                        channel=channel, thread_ts=thread_ts, text=reply,
+                        unfurl_links=False, unfurl_media=False)
+            except Exception as exc:
+                logger.error("brain-mode turn on %s failed: %s", thread_ts, exc)
+            finally:
+                self._active_threads.discard(thread_ts)
+                if self._run_tasks.get(thread_ts) is asyncio.current_task():
+                    self._run_tasks.pop(thread_ts, None)
+            return
+
         self._active_threads.add(thread_ts)
         self._run_tasks[thread_ts] = asyncio.current_task()  # type: ignore[assignment]
         reporter = self._make_reporter(channel, thread_ts, user_id, user_team)
