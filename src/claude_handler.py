@@ -36,6 +36,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import slack_files
+
 logger = logging.getLogger(__name__)
 
 # Flow-B runs are real work that can legitimately take 30–60+ min, so we do NOT
@@ -276,17 +278,20 @@ class ClaudeHandler:
     # Both Slack entry points (new mention, thread reply) run one continuous
     # per-project conversation, so these are thin wrappers over handle_turn.
     async def handle_message(
-        self, channel: str, message_ts: str, text: str, reporter: Any = None
+        self, channel: str, message_ts: str, text: str, reporter: Any = None,
+        files: list | None = None,
     ) -> str:
-        return await self.handle_turn(channel, message_ts, text, reporter)
+        return await self.handle_turn(channel, message_ts, text, reporter, files=files)
 
     async def handle_thread_reply(
-        self, channel: str, thread_ts: str, text: str, reporter: Any = None
+        self, channel: str, thread_ts: str, text: str, reporter: Any = None,
+        files: list | None = None,
     ) -> str:
-        return await self.handle_turn(channel, thread_ts, text, reporter)
+        return await self.handle_turn(channel, thread_ts, text, reporter, files=files)
 
     async def handle_turn(
-        self, channel: str, thread_ts: str, text: str, reporter: Any = None
+        self, channel: str, thread_ts: str, text: str, reporter: Any = None,
+        files: list | None = None,
     ) -> str:
         """Run one turn, resuming the project's continuous Claude session.
 
@@ -320,6 +325,14 @@ class ClaudeHandler:
             + _memory_addendum(project_dir)
         )
 
+        # Image/file attachments → download to a container-local dir and tell claude -p
+        # to Read them (it has the Read tool + full access in the project cwd).
+        attach_note = ""
+        if files:
+            dest = Path("/tmp/slack-attachments") / thread_ts.replace(".", "_")
+            downloaded = slack_files.download(files, dest, os.getenv("SLACK_BOT_TOKEN", ""))
+            attach_note = slack_files.prompt_note(downloaded)
+
         session_id, resume = self._session_for(cwd_key, project_dir, force_new)
         prompt = text
         if resume:
@@ -337,6 +350,9 @@ class ClaudeHandler:
                 )
             cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir,
                                   system_prompt=system_prompt)
+
+        if attach_note:
+            prompt = prompt + attach_note
 
         async with self._lock_for(cwd_key):
             result = await self._run_claude(cmd, prompt, cwd=project_dir, reporter=reporter)

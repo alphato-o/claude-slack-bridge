@@ -27,12 +27,15 @@ import time
 from pathlib import Path
 from typing import Any
 
+import slack_files
+
 logger = logging.getLogger(__name__)
 
 BRAIN_DIR = Path(os.getenv("BRAIN_DIR", "/brain"))
 ACK_EMOJI = os.getenv("BRAIN_ACK_EMOJI", "eyes")
 REPLY_TIMEOUT = int(os.getenv("BRAIN_REPLY_TIMEOUT", "600"))   # seconds to await the brain
 POLL = 0.4
+BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 
 
 class BrainExecutor:
@@ -46,7 +49,7 @@ class BrainExecutor:
     async def handle_turn(
         self, channel: str, thread_ts: str, text: str, *,
         user: str = "", user_name: str = "", is_dm: bool = False,
-        mentioned: bool = False, message_ts: str = "",
+        mentioned: bool = False, message_ts: str = "", files: list | None = None,
     ) -> str:
         evt_id = f"evt_{message_ts or thread_ts or time.time()}".replace(".", "_")
         anchor_ts = thread_ts or message_ts
@@ -58,11 +61,17 @@ class BrainExecutor:
             except Exception as exc:
                 logger.debug("ack reaction failed: %s", exc)
 
+        # 1b) download any image/file attachments into the bind-mounted brain dir so the
+        #     native brain can Read them (Slack url_private needs the bot token).
+        attachments = slack_files.download(
+            files or [], BRAIN_DIR / "inbox" / f"{evt_id}_files", BOT_TOKEN)
+
         # 2) write the event to the host inbox
         event = {
             "id": evt_id, "channel": channel, "thread_ts": anchor_ts,
             "message_ts": message_ts, "user": user, "user_name": user_name,
-            "is_dm": is_dm, "mentioned": mentioned, "text": text, "t": time.time(),
+            "is_dm": is_dm, "mentioned": mentioned, "text": text,
+            "attachments": attachments, "t": time.time(),
         }
         inbox_f = BRAIN_DIR / "inbox" / f"{evt_id}.json"
         tmp = inbox_f.with_suffix(".tmp")

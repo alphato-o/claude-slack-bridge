@@ -143,7 +143,8 @@ class SlackDaemon:
                 return
             self._active_threads.add(thread_ts)  # claim synchronously (close the race)
             asyncio.create_task(self._run_turn(
-                channel, thread_ts, text, user_id, is_new=False, user_team=user_team))
+                channel, thread_ts, text, user_id, is_new=False, user_team=user_team,
+                files=event.get("files")))
             return
 
         # Case 3: Top-level message — respond if @mentioned, OR if this is a brain-mode
@@ -163,7 +164,8 @@ class SlackDaemon:
             return
         self._active_threads.add(message_ts)
         asyncio.create_task(self._run_turn(
-            channel, message_ts, text, user_id, is_new=True, user_team=user_team))
+            channel, message_ts, text, user_id, is_new=True, user_team=user_team,
+            files=event.get("files")))
 
     def _brain_answers_all(self, channel: str) -> bool:
         """Brain-mode channel that answers EVERY message (not just @mentions)?
@@ -232,6 +234,7 @@ class SlackDaemon:
     async def _run_turn(
         self, channel: str, thread_ts: str, text: str,
         user_id: str = "", is_new: bool = False, user_team: str = "",
+        files: list | None = None,
     ) -> None:
         """Run one Claude turn for *thread_ts*, tracked so it can be interrupted.
 
@@ -256,6 +259,7 @@ class SlackDaemon:
                     channel, thread_ts, text,
                     user=user_id, user_name=user_name,
                     is_dm=channel.startswith("D"), mentioned=True, message_ts=thread_ts,
+                    files=files,
                 )
                 if reply:
                     await self._app.client.chat_postMessage(
@@ -274,7 +278,7 @@ class SlackDaemon:
         reporter = self._make_reporter(channel, thread_ts, user_id, user_team)
         try:
             await reporter.start()
-            response = await self._claude.handle_turn(channel, thread_ts, text, reporter)
+            response = await self._claude.handle_turn(channel, thread_ts, text, reporter, files=files)
             await reporter.finish(response)
         except asyncio.CancelledError:
             # Intentional hard interrupt — finalize the stream, don't treat as error.
