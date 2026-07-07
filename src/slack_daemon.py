@@ -178,12 +178,13 @@ class SlackDaemon:
 
     def _brain_answers_all(self, channel: str) -> bool:
         """Brain-mode channel that answers EVERY message (not just @mentions)?
-        Controlled per-channel by projects.json ``"answer_all": true`` (default true
-        for brain channels — they're dedicated Dario surfaces)."""
+        Default FALSE — brain channels are @mention-only, so unrelated chatter in a
+        shared channel isn't routed to Dario. Opt in per-channel with
+        projects.json ``"answer_all": true`` (e.g. a truly Dario-only channel)."""
         cfg = self._claude._channel_id_to_project.get(channel) or self._claude._project_map.get(channel)
         if isinstance(cfg, dict):
-            return cfg.get("answer_all", True)
-        return True
+            return cfg.get("answer_all", False)
+        return False
 
     async def _handle_app_mention(self, event: dict[str, Any]) -> None:
         """Handle app_mention events (bot @mentioned in any channel)."""
