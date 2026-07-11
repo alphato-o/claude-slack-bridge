@@ -13,6 +13,10 @@ else
     echo "warning: /host-claude/.credentials.json not found — claude will be 'Not logged in'."
 fi
 
+# The Agent SDK / CLI expect a ~/.claude.json config file; seed an empty one if
+# absent so it doesn't warn/backup on every run. (Persists in the claude-home volume.)
+[ -f /home/appuser/.claude.json ] || echo '{}' > /home/appuser/.claude.json
+
 if [ -n "$GITHUB_TOKEN" ] || [ -n "$GH_TOKEN" ]; then
     gh auth setup-git 2>&1 || echo "warning: gh auth setup-git failed; git push to github.com over HTTPS may not authenticate"
 fi

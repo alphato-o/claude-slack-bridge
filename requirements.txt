@@ -8,3 +8,7 @@ slack-sdk>=3.42.0
 aiohttp
 pydantic-settings
 pytest>=7
+# The Claude Agent SDK — the in-process alternative to spawning `claude -p` and
+# parsing stream-json. Selected via CLAUDE_RUNTIME=sdk (default is the CLI path).
+# Rides the same subscription creds as the CLI (verified: no ANTHROPIC_API_KEY needed).
+claude-agent-sdk>=0.2.116

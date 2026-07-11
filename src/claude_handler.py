@@ -48,6 +48,10 @@ logger = logging.getLogger(__name__)
 IDLE_TIMEOUT = int(os.getenv("FLOW_B_IDLE_TIMEOUT", "1200"))   # 20 min of silence
 MAX_RUNTIME = int(os.getenv("FLOW_B_MAX_RUNTIME", "14400"))    # 4 h hard cap
 WATCHDOG_INTERVAL = 15  # how often the watchdog checks (seconds)
+
+# Engine: "cli" spawns `claude -p` and parses stream-json (default, battle-tested);
+# "sdk" uses the in-process Claude Agent SDK (typed messages, no JSON parsing).
+CLAUDE_RUNTIME = os.getenv("CLAUDE_RUNTIME", "cli").lower()
 # Claude CLI in stream-json mode emits one JSON event per line. A single
 # event can embed large tool inputs/results (file reads, MCP responses,
 # task outputs), easily exceeding asyncio's default 64 KB StreamReader
@@ -230,6 +234,41 @@ def _anchor_addendum(channel: str, thread_ts: str) -> str:
     )
 
 
+def _sdk_event(msg: Any) -> dict[str, Any] | None:
+    """Adapt an Agent-SDK message object to the same stream-json-style dict that
+    ``slack_progress`` already consumes — so the whole live-progress layer is
+    reused unchanged whether the engine is the CLI or the SDK."""
+    from claude_agent_sdk import (  # lazy: only when the SDK engine is used
+        AssistantMessage, ResultMessage, TextBlock, ThinkingBlock,
+        ToolResultBlock, ToolUseBlock, UserMessage,
+    )
+    if isinstance(msg, AssistantMessage):
+        content: list[dict[str, Any]] = []
+        for b in msg.content:
+            if isinstance(b, TextBlock):
+                content.append({"type": "text", "text": b.text})
+            elif isinstance(b, ThinkingBlock):
+                content.append({"type": "thinking", "thinking": b.thinking})
+            elif isinstance(b, ToolUseBlock):
+                content.append({"type": "tool_use", "name": b.name, "id": b.id, "input": b.input})
+        return {"type": "assistant", "message": {"content": content}} if content else None
+    if isinstance(msg, UserMessage):
+        blocks: list[dict[str, Any]] = []
+        for b in (msg.content if isinstance(msg.content, list) else []):
+            if isinstance(b, ToolResultBlock):
+                blocks.append({
+                    "type": "tool_result", "tool_use_id": b.tool_use_id,
+                    "content": b.content, "is_error": bool(getattr(b, "is_error", False)),
+                })
+        return {"type": "user", "message": {"content": blocks}} if blocks else None
+    if isinstance(msg, ResultMessage):
+        return {
+            "type": "result", "result": msg.result, "usage": msg.usage,
+            "num_turns": msg.num_turns, "subtype": msg.subtype,
+        }
+    return None  # SystemMessage / RateLimitEvent / StreamEvent → nothing to render
+
+
 class ClaudeHandler:
     """
     Manages Claude Code CLI invocations for Slack messages.
@@ -338,27 +377,34 @@ class ClaudeHandler:
 
         session_id, resume = self._session_for(cwd_key, project_dir, force_new)
         prompt = text
-        if resume:
-            logger.info("Resuming session %s for %s (thread %s)", session_id, cwd_key, thread_ts)
-            cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir,
-                                  system_prompt=system_prompt)
-        else:
-            logger.info("New session %s for %s%s (thread %s)", session_id, cwd_key,
-                        " (/new)" if force_new else "", thread_ts)
+        if not resume:
             tail = _journal_tail(cwd_key)
             if tail:
                 prompt = (
                     "## Earlier work in this project (prior Slack sessions — context only)\n"
                     f"{tail}\n\n---\n\n## Current request\n{text}"
                 )
-            cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir,
-                                  system_prompt=system_prompt)
-
         if attach_note:
             prompt = prompt + attach_note
+        logger.info("%s session %s for %s%s (thread %s) via %s engine",
+                    "Resuming" if resume else "New", session_id, cwd_key,
+                    " (/new)" if force_new else "", thread_ts, CLAUDE_RUNTIME)
 
+        # Same session_id either way: --session-id (new) or --resume (continue).
         async with self._lock_for(cwd_key):
-            result = await self._run_claude(cmd, prompt, cwd=project_dir, reporter=reporter)
+            if CLAUDE_RUNTIME == "sdk":
+                result = await self._run_sdk(
+                    prompt, project_dir, system_prompt, reporter,
+                    session_id=(None if resume else session_id),
+                    resume=(session_id if resume else None),
+                )
+            else:
+                cmd = self._build_cmd(
+                    session_id=(None if resume else session_id),
+                    resume=(session_id if resume else None),
+                    plugin_dir=plugin_dir, system_prompt=system_prompt,
+                )
+                result = await self._run_claude(cmd, prompt, cwd=project_dir, reporter=reporter)
         _append_journal(cwd_key, text, result)
         return result
 
@@ -546,6 +592,89 @@ class ClaudeHandler:
         if resume:
             cmd.extend(["--resume", resume])
         return cmd
+
+    async def _run_sdk(
+        self, prompt: str, cwd: str | None, system_prompt: str, reporter: Any = None,
+        session_id: str | None = None, resume: str | None = None,
+    ) -> str:
+        """Run one turn via the Claude Agent SDK (in-process, typed messages).
+
+        Mirrors ``_run_claude``'s contract: streams messages to *reporter* (via the
+        stream-json-shaped adapter) and returns the final reply text. Same idle /
+        max-runtime watchdog; a hard interrupt (task cancellation) tears down the
+        SDK query. Slack/GitHub tokens are stripped from the child's env, and
+        ANTHROPIC_API_KEY too so it stays on the subscription creds."""
+        from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
+
+        env = os.environ.copy()
+        for _k in ("CLAUDECODE", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "ANTHROPIC_API_KEY"):
+            env.pop(_k, None)
+        options = ClaudeAgentOptions(
+            cwd=cwd or None,
+            permission_mode="bypassPermissions",
+            system_prompt={"type": "preset", "preset": "claude_code", "append": system_prompt},
+            env=env,
+        )
+        if resume:
+            options.resume = resume
+        elif session_id:
+            options.session_id = session_id
+
+        final_result: str | None = None
+        start = time.monotonic()
+        last_activity = start
+
+        async def consume() -> None:
+            nonlocal final_result, last_activity
+            async for msg in query(prompt=prompt, options=options):
+                last_activity = time.monotonic()
+                if isinstance(msg, ResultMessage):
+                    final_result = msg.result
+                if reporter is not None:
+                    event = _sdk_event(msg)
+                    if event is not None:
+                        try:
+                            await reporter.on_event(event)
+                        except Exception as exc:
+                            logger.debug("reporter.on_event failed (ignored): %s", exc)
+
+        async def watchdog() -> str:
+            while True:
+                await asyncio.sleep(WATCHDOG_INTERVAL)
+                now = time.monotonic()
+                if now - last_activity > IDLE_TIMEOUT:
+                    return "idle"
+                if now - start > MAX_RUNTIME:
+                    return "max"
+
+        work = asyncio.ensure_future(consume())
+        wd = asyncio.ensure_future(watchdog())
+        try:
+            done, _ = await asyncio.wait({work, wd}, return_when=asyncio.FIRST_COMPLETED)
+            if work not in done:
+                reason = wd.result()
+                logger.error("SDK run stalled (%s) after %ds elapsed / %ds idle",
+                             reason, int(time.monotonic() - start),
+                             int(time.monotonic() - last_activity))
+                if final_result:
+                    return final_result
+                mins = IDLE_TIMEOUT // 60 if reason == "idle" else MAX_RUNTIME // 60
+                why = (f"went quiet for {mins} min (looked stuck)" if reason == "idle"
+                       else f"hit the {mins // 60} h max-runtime cap")
+                return f"_(I stopped — the run {why}. Reply in this thread to continue where I left off.)_"
+            await work  # surface exceptions
+            if final_result is None:
+                logger.warning("SDK run ended with no result message.")
+                return "Sorry, I couldn't parse the response."
+            return final_result
+        finally:
+            wd.cancel()
+            if not work.done():
+                work.cancel()
+            try:
+                await work
+            except Exception:
+                pass
 
     async def _run_claude(
         self, cmd: list[str], prompt: str, cwd: str | None = None, reporter: Any = None
