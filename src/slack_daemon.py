@@ -300,6 +300,22 @@ class SlackDaemon:
                 self._active_threads.discard(thread_ts)
                 if self._run_tasks.get(thread_ts) is asyncio.current_task():
                     self._run_tasks.pop(thread_ts, None)
+                # BUGFIX 2026-07-13: brain-mode returned here WITHOUT draining
+                # self._queued — soft-interrupt messages ("fold into the next
+                # turn") were promised to the user but silently lost forever
+                # (a real correction from wenrui was dropped this way). Mirror
+                # the non-brain drain; synthetic msg_ts keeps the brain-side
+                # event id unique (a combined drain has no single message ts,
+                # and reusing thread_ts would collide with the done-ledger).
+                queued = self._queued.pop(thread_ts, None)
+                if queued:
+                    combined = "\n\n".join(queued)
+                    logger.info("Draining %d queued msg(s) on %s as the next brain turn.",
+                                len(queued), thread_ts)
+                    self._active_threads.add(thread_ts)  # claim before the await gap
+                    asyncio.create_task(self._run_turn(
+                        channel, thread_ts, combined, user_id, is_new=False,
+                        user_team=user_team, msg_ts=f"{time.time():.6f}"))
             return
 
         self._active_threads.add(thread_ts)
