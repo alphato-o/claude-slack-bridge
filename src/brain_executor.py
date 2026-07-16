@@ -215,18 +215,12 @@ class BrainExecutor:
             return False
 
     async def _done_react(self, channel, message_ts) -> None:
+        # ✅ done signal on the user's message (in addition to the 👀 ack)
         try:
             await self._client.reactions_add(
                 channel=channel, timestamp=message_ts, name="white_check_mark")
         except Exception as exc:
             logger.debug("done reaction failed: %s", exc)
-        # ✅ done signal on the user's message (in addition to the 👀 ack)
-        if message_ts and stripped not in ("",):
-            try:
-                await self._client.reactions_add(
-                    channel=channel, timestamp=message_ts, name="white_check_mark")
-            except Exception as exc:
-                logger.debug("done reaction failed: %s", exc)
 
 
 def channel_mode(config: Any, default_mode: str) -> str:
