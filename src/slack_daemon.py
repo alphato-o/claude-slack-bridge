@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/slack-bridge.sock"
 
+# Dario<->Bran hotline: normally all bot-authored messages are dropped (self-echo guard),
+# but an allowlisted sibling bot may consult the live brain via a bot-authored @-mention
+# in an allowlisted channel. Default = the Phi campaign fleet's bridge bot in
+# #withclaude-phicampaigner. Override via env (comma-separated). Our own bot is never
+# listed here, so self-echo stays blocked.
+HOTLINE_BOT_CHANNELS = {c for c in os.environ.get("HOTLINE_BOT_CHANNELS", "C0BCJM4DLNQ").split(",") if c}
+HOTLINE_BOT_IDS = {b for b in os.environ.get("HOTLINE_BOT_IDS", "B0BCC9KTTRS").split(",") if b}
+
 
 class SlackDaemon:
     """
@@ -63,9 +71,20 @@ class SlackDaemon:
         self._app.event("member_joined_channel")(self._handle_member_joined)
 
     async def _handle_slack_message(self, event: dict[str, Any]) -> None:
-        # Filter: Ignore bot messages (prevents self-echo loops).
-        if event.get("bot_id"):
-            return
+        # Filter bot messages to prevent self-echo loops. EXCEPTION: an allowlisted sibling
+        # bot (the Phi campaign fleet's bridge on Bran) may consult the live brain via a
+        # bot-authored @-mention of Dario in the hotline channel. Our own bot is never in
+        # HOTLINE_BOT_IDS, so self-echo is still dropped.
+        bot_id = event.get("bot_id")
+        if bot_id:
+            hotline = (
+                event.get("channel") in HOTLINE_BOT_CHANNELS
+                and bot_id in HOTLINE_BOT_IDS
+                and f"<@{self._bot_user_id}>" in (event.get("text") or "")
+            )
+            if not hotline:
+                return
+            logger.info("hotline: accepting bot mention from %s in %s", bot_id, event.get("channel"))
 
         # Dedupe: a mention can arrive as BOTH a `message` and an `app_mention`
         # event with the same ts; process each user message exactly once.
