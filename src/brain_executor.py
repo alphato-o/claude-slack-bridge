@@ -36,15 +36,33 @@ ACK_EMOJI = os.getenv("BRAIN_ACK_EMOJI", "eyes")
 REPLY_TIMEOUT = int(os.getenv("BRAIN_REPLY_TIMEOUT", "600"))   # seconds to await the brain
 POLL = 0.4
 BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
+# Animate the reply via Slack's streaming API (native 'text appearing' effect). On by default.
+STREAM_REVEAL = os.getenv("BRAIN_STREAM_REVEAL", "true").lower() == "true"
+CHUNK_CHARS = int(os.getenv("BRAIN_STREAM_CHUNK", "28"))       # ~chars per animated append
+
+
+def _chunks(text: str):
+    """Split text into streaming chunks at word boundaries (~CHUNK_CHARS each) so the
+    reveal animates smoothly without one giant append or hundreds of tiny ones."""
+    words, buf, n = text.split(" "), [], 0
+    for w in words:
+        buf.append(w); n += len(w) + 1
+        if n >= CHUNK_CHARS:
+            yield " ".join(buf) + " "; buf, n = [], 0
+    if buf:
+        yield " ".join(buf)
 
 
 class BrainExecutor:
     """Routes a Slack turn to the single standing Dario brain via a host inbox/outbox."""
 
-    def __init__(self, slack_client: Any) -> None:
+    def __init__(self, slack_client: Any, team_id: str = "") -> None:
         self._client = slack_client
+        self._team_id = team_id or os.getenv("SLACK_TEAM_ID", "")
         (BRAIN_DIR / "inbox").mkdir(parents=True, exist_ok=True)
         (BRAIN_DIR / "outbox").mkdir(parents=True, exist_ok=True)
+
+    THINKING = "🧠 _Dario is thinking…_"
 
     async def handle_turn(
         self, channel: str, thread_ts: str, text: str, *,
@@ -54,24 +72,40 @@ class BrainExecutor:
         evt_id = f"evt_{message_ts or thread_ts or time.time()}".replace(".", "_")
         anchor_ts = thread_ts or message_ts
 
-        # 1) instant ack — a reaction on the source message (no brain round-trip)
+        # 1) instant ack — 👀 reaction on the source message (no brain round-trip)
         if message_ts:
             try:
                 await self._client.reactions_add(channel=channel, timestamp=message_ts, name=ACK_EMOJI)
             except Exception as exc:
                 logger.debug("ack reaction failed: %s", exc)
 
+        # 1a) SHIMMER — assistant.threads.setStatus animates the "Dario" title in theme
+        #     colour ("is working"). Set it now, refresh it through the think, clear on
+        #     reply. This is the actual title-shimmer (separate from text streaming).
+        #     If setStatus is unavailable, fall back to a static "🧠 thinking…" placeholder.
+        placeholder_ts = shimmer = None
+        status_ok = await self._set_status(channel, anchor_ts, "🧠 Dario is thinking…")
+        if status_ok:
+            shimmer = asyncio.ensure_future(self._shimmer(channel, anchor_ts))
+        else:
+            try:
+                r = await self._client.chat_postMessage(
+                    channel=channel, thread_ts=anchor_ts, text=self.THINKING)
+                placeholder_ts = r.get("ts")
+            except Exception as exc:
+                logger.debug("placeholder post failed: %s", exc)
+
         # 1b) download any image/file attachments into the bind-mounted brain dir so the
         #     native brain can Read them (Slack url_private needs the bot token).
         attachments = slack_files.download(
             files or [], BRAIN_DIR / "inbox" / f"{evt_id}_files", BOT_TOKEN)
 
-        # 2) write the event to the host inbox
+        # 2) write the event to the host inbox (native brain reads it via slack_loop)
         event = {
             "id": evt_id, "channel": channel, "thread_ts": anchor_ts,
             "message_ts": message_ts, "user": user, "user_name": user_name,
             "is_dm": is_dm, "mentioned": mentioned, "text": text,
-            "attachments": attachments, "t": time.time(),
+            "attachments": attachments, "placeholder_ts": placeholder_ts, "t": time.time(),
         }
         inbox_f = BRAIN_DIR / "inbox" / f"{evt_id}.json"
         tmp = inbox_f.with_suffix(".tmp")
@@ -79,24 +113,120 @@ class BrainExecutor:
         tmp.rename(inbox_f)                                   # atomic publish
         logger.info("brain-mode: queued %s (chan %s, thread %s)", evt_id, channel, anchor_ts)
 
-        # 3) await the brain's reply file
+        # 3) await the brain's reply file, then reveal the answer into the open stream
         reply_f = BRAIN_DIR / "outbox" / f"{evt_id}.reply"
         deadline = time.monotonic() + REPLY_TIMEOUT
+        out = None
         while time.monotonic() < deadline:
             if reply_f.exists():
-                text_out = reply_f.read_text()
+                out = reply_f.read_text()
                 try: reply_f.unlink()
                 except FileNotFoundError: pass
-                logger.info("brain-mode: got reply for %s (%d chars)", evt_id, len(text_out))
-                # The brain typically posts its own richly-formatted reply via slack_say and
-                # writes a sentinel here; an empty/"__posted__" reply means "already posted,
-                # don't double-post". Non-empty → daemon posts it as the thread reply.
-                return "" if text_out.strip() in ("", "__posted__") else text_out
+                logger.info("brain-mode: got reply for %s (%d chars)", evt_id, len(out))
+                break
             await asyncio.sleep(POLL)
+        if out is None:
+            logger.warning("brain-mode: timeout awaiting reply for %s", evt_id)
+            out = "⏳ Still working on this one — I'll follow up in this thread when it's done."
 
-        logger.warning("brain-mode: timeout awaiting reply for %s", evt_id)
-        return ("⏳ I've got your message and I'm on it — this one's taking longer than usual. "
-                "I'll follow up in this thread when it's done.")
+        if shimmer:
+            shimmer.cancel()
+        await self._clear_status(channel, anchor_ts)       # stop the title shimmer
+        await self._finish(channel, anchor_ts, placeholder_ts, message_ts, user, out)
+        return ""
+
+    async def _set_status(self, channel, thread_ts, status: str) -> bool:
+        """Set the animated 'is working' status on the app title (the shimmer). Returns
+        True if the API accepted it (i.e. the shimmer is showing)."""
+        try:
+            r = await self._client.assistant_threads_setStatus(
+                channel_id=channel, thread_ts=thread_ts, status=status)
+            return bool(r.get("ok"))
+        except Exception as exc:
+            logger.debug("setStatus unavailable (%s) — using placeholder", exc)
+            return False
+
+    async def _clear_status(self, channel, thread_ts) -> None:
+        try:
+            await self._client.assistant_threads_setStatus(
+                channel_id=channel, thread_ts=thread_ts, status="")
+        except Exception:
+            pass
+
+    async def _shimmer(self, channel, thread_ts):
+        """Refresh the status periodically so the shimmer holds through a long think."""
+        try:
+            while True:
+                await asyncio.sleep(9)
+                await self._client.assistant_threads_setStatus(
+                    channel_id=channel, thread_ts=thread_ts, status="🧠 Dario is thinking…")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.debug("shimmer refresh stopped: %s", exc)
+
+    async def _finish(self, channel, thread_ts, placeholder_ts, message_ts, user, out: str) -> None:
+        """Reveal the brain's reply — text streams in (chat.appendStream animation), or
+        morph the fallback placeholder. Then a ✅ done reaction.
+        - "__posted__" → brain posted a rich message itself; remove any placeholder.
+        - "" (empty)   → no reply; remove any placeholder.
+        """
+        stripped = out.strip()
+        if stripped in ("", "__posted__"):
+            if placeholder_ts:
+                try: await self._client.chat_delete(channel=channel, ts=placeholder_ts)
+                except Exception as exc: logger.debug("placeholder delete failed: %s", exc)
+            if message_ts and stripped == "__posted__":
+                await self._done_react(channel, message_ts)
+            return
+
+        # animate the answer with a streamed reveal (text appears); morph placeholder on fallback
+        streamed = False
+        if STREAM_REVEAL and not placeholder_ts:
+            streamed = await self._stream_reveal(channel, thread_ts, user, out)
+        if not streamed:
+            if placeholder_ts:
+                try:
+                    await self._client.chat_update(channel=channel, ts=placeholder_ts, text=out)
+                except Exception as exc:
+                    logger.debug("placeholder update failed (%s) — posting fresh", exc)
+                    await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=out)
+            else:
+                await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=out)
+        if message_ts:
+            await self._done_react(channel, message_ts)
+
+    async def _stream_reveal(self, channel, thread_ts, user, out: str) -> bool:
+        """Stream the answer text in (the 'text appearing' animation). Returns True on success."""
+        try:
+            kw = dict(channel=channel, thread_ts=thread_ts)
+            if user and self._team_id:
+                kw["recipient_user_id"] = user
+                kw["recipient_team_id"] = self._team_id
+            stream_ts = (await self._client.chat_startStream(**kw))["ts"]
+            for chunk in _chunks(out):
+                await self._client.chat_appendStream(
+                    channel=channel, ts=stream_ts,
+                    chunks=[{"type": "markdown_text", "text": chunk}])
+            await self._client.chat_stopStream(channel=channel, ts=stream_ts)
+            return True
+        except Exception as exc:
+            logger.debug("stream reveal failed (%s) — will post fresh", exc)
+            return False
+
+    async def _done_react(self, channel, message_ts) -> None:
+        try:
+            await self._client.reactions_add(
+                channel=channel, timestamp=message_ts, name="white_check_mark")
+        except Exception as exc:
+            logger.debug("done reaction failed: %s", exc)
+        # ✅ done signal on the user's message (in addition to the 👀 ack)
+        if message_ts and stripped not in ("",):
+            try:
+                await self._client.reactions_add(
+                    channel=channel, timestamp=message_ts, name="white_check_mark")
+            except Exception as exc:
+                logger.debug("done reaction failed: %s", exc)
 
 
 def channel_mode(config: Any, default_mode: str) -> str:
