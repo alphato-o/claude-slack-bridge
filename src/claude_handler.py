@@ -152,10 +152,14 @@ def _save_sessions(mapping: dict[str, str]) -> None:
 
 def _session_file_exists(project_dir: str | None, session_id: str) -> bool:
     """True if Claude's on-disk transcript for this session exists, so we can
-    safely ``--resume`` it (vs re-creating it with ``--session-id``)."""
-    if not project_dir:
-        return False
-    slug = project_dir.replace("/", "-")
+    safely ``--resume`` it (vs re-creating it with ``--session-id``).
+
+    When *project_dir* is None (an unmapped channel using the default cwd), the
+    CLI/SDK run in the daemon's own working dir and write the transcript under
+    that dir's slug — so resolve against ``os.getcwd()`` rather than bailing to
+    False. Returning False here was re-issuing ``--session-id`` for a live
+    session on every turn, which the engine rejects as 'already in use'."""
+    slug = (project_dir or os.getcwd()).replace("/", "-")
     return (CLAUDE_HOME / "projects" / slug / f"{session_id}.jsonl").exists()
 
 
