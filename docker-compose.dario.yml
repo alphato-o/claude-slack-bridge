@@ -9,6 +9,10 @@ services:
       - DEFAULT_MODE=brain
       - BRAIN_DIR=/brain
       - SLACK_TEAM_ID=${SLACK_TEAM_ID}
+      # Dario<->Bran fleet hotline channels: allow the fleet bridge bot (HOTLINE_BOT_IDS default
+      # B0BCC9KTTRS) to @-mention Dario here past the bot-echo filter. C0BCJM4DLNQ = #withclaude-
+      # phicampaigner (original), C0BJ02WHY07 = #bot-starkhotline (dedicated hotline). See slack_daemon.py.
+      - HOTLINE_BOT_CHANNELS=C0BCJM4DLNQ,C0BJ02WHY07
     volumes:
       - ${HOME}/.claude:/host-claude:ro
       - /Users/fydeos/Dev/ccplayground:/projects
