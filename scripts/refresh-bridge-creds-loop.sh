@@ -15,8 +15,10 @@ INTERVAL="${INTERVAL:-3600}"
 LOG="${LOG:-$HOME/.claude-bridge-creds.log}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-echo "$(date '+%F %T') === loop up (pid $$, every ${INTERVAL}s, script=$HERE) ===" >> "$LOG"
+# tee: output is visible live (e.g. in a tmux window) AND appended to the log.
+echo "$(date '+%F %T') === loop up (pid $$, every ${INTERVAL}s, script=$HERE) ===" | tee -a "$LOG"
 while true; do
-    sh "$HERE/refresh-bridge-creds.sh" >> "$LOG" 2>&1
+    sh "$HERE/refresh-bridge-creds.sh" 2>&1 | tee -a "$LOG"
+    echo "$(date '+%F %T') next refresh in ${INTERVAL}s ..." | tee -a "$LOG"
     sleep "$INTERVAL"
 done
