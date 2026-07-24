@@ -153,15 +153,25 @@ class SlackDaemon:
         # (the bug: previously ANY thread reply spawned a run, so the bot chimed
         # into colleagues' conversations it was never tagged in).
         if thread_ts:
-            if not (mentioned or thread_ts in self._bot_threads):
-                if thread_ts in self._non_bot_threads:
-                    return  # already classified as a human-only thread
-                if not await self._is_bot_thread(channel, thread_ts):
-                    self._non_bot_threads.add(thread_ts)
-                    logger.info("Ignoring reply in non-bot thread %s.", thread_ts)
+            if not mentioned:
+                is_bot_thread = thread_ts in self._bot_threads
+                if not is_bot_thread:
+                    if thread_ts in self._non_bot_threads:
+                        return  # already classified as a human-only thread
+                    if not await self._is_bot_thread(channel, thread_ts):
+                        self._non_bot_threads.add(thread_ts)
+                        logger.info("Ignoring reply in non-bot thread %s.", thread_ts)
+                        return
+                # It IS a bot thread, but only auto-continue WITHOUT a mention while it
+                # stays 1:1 (the bot + a single human). Once a 2nd human joins, require an
+                # explicit @-mention so the bot does not chime into a group conversation.
+                if await self._thread_human_count(channel, thread_ts) > 1:
+                    logger.info(
+                        "Multi-human thread %s without mention — awaiting explicit @.",
+                        thread_ts)
                     return
-            # Engaged — remember this is a bot thread so later replies continue it
-            # without a re-mention (collaborative: anyone may pick it up).
+            # Engaged (an @-mention, or a 1:1 bot thread). Remember it is a bot thread so
+            # 1:1 follow-ups continue without a re-mention.
             self._bot_threads.add(thread_ts)
             self._non_bot_threads.discard(thread_ts)
             if mentioned:
@@ -263,6 +273,28 @@ class SlackDaemon:
             if mention in (m.get("text") or ""):
                 return True  # someone tagged the bot in this thread
         return False
+
+    async def _thread_human_count(self, channel: str, thread_ts: str) -> int:
+        """Count the DISTINCT human participants in a thread (the bot and any bot-authored
+        messages excluded). Used to gate no-mention auto-continue: engage without an
+        @-mention only while it is 1:1 (one human). On API failure we return a large number
+        so the caller stays quiet (require an explicit mention) rather than barging in."""
+        try:
+            resp = await self._app.client.conversations_replies(
+                channel=channel, ts=thread_ts, limit=200)
+            messages = resp.get("messages", []) or []
+        except Exception as exc:
+            logger.warning(
+                "human-count fetch failed for %s (%s) — treating as multi-human.",
+                thread_ts, exc)
+            return 99
+        humans: set[str] = set()
+        for m in messages:
+            uid = m.get("user")
+            if not uid or uid == self._bot_user_id or m.get("bot_id"):
+                continue  # skip the bot itself and any bot-authored messages
+            humans.add(uid)
+        return len(humans)
 
     def _make_reporter(
         self, channel: str, thread_ts: str, user_id: str, user_team: str = ""
