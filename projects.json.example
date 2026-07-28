@@ -8,9 +8,37 @@
     "mode": "session"
   },
 
-  "// brain mode: routes to ONE standing Claude session (Dario). path is informational.": "",
+  "// joint channel: ONE conversation spanning EXTRA projects (--add-dir).": "",
+  "// add_dirs grants tool access + CLAUDE.md of each extra dir; the memory": "",
+  "// addendum covers every listed project (mount each memory dir in compose).": "",
+  "// system_note (optional) appends channel-specific guidance to the system prompt.": "",
+  "C067JOINT001": {
+    "path": "/projects/storeA",
+    "add_dirs": ["/projects/storeB"],
+    "system_note": "This channel covers store A AND store B; say which one you acted on."
+  },
+
+  "// named sub-session: several channels can share one project dir, each with": "",
+  "// its OWN continuous session (session key added to the cwd key).": "",
+  "C089DESKY002": {
+    "path": "/projects/bigproject",
+    "session": "support-desk"
+  },
+
+  "// brain mode: routes to a standing native Claude session via an inbox/outbox": "",
+  "// handoff dir. Without brain_dir it is THE default brain (BRAIN_DIR env, the": "",
+  "// classic Dario deployment). With brain_dir it is a PER-CHANNEL brain (e.g. a": "",
+  "// project desk) — bind-mount the host dir in docker-compose. brain_name shows": "",
+  "// in the thinking status; brain_reply_timeout (s) overrides BRAIN_REPLY_TIMEOUT.": "",
   "C0BDDBY120J": {
     "path": "/Users/fydeos/Dev/ccplayground/projectDario",
     "mode": "brain"
+  },
+  "C0CDESKBRAIN": {
+    "path": "/projects/bigproject",
+    "mode": "brain",
+    "brain_dir": "/brain/metrics-desk",
+    "brain_name": "metrics-desk",
+    "brain_reply_timeout": 900
   }
 }

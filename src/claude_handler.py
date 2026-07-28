@@ -197,24 +197,38 @@ def _append_journal(cwd_key: str, request: str, result: str) -> None:
         logger.debug("journal append failed: %s", exc)
 
 
-def _memory_addendum(project_dir: str | None) -> str:
+def _memory_addendum(project_dir: str | None, add_dirs: list[str] | None = None) -> str:
     """System-prompt addendum pointing Claude at this project's shared, file-based
     memory. Headless ``claude -p`` does NOT auto-recall memory and the container
     has no global memory instructions, so we must tell it explicitly — and the
-    memory dir is bind-mounted to share one store with Alpha's terminal Claude."""
+    memory dir is bind-mounted to share one store with Alpha's terminal Claude.
+
+    A joint channel (``add_dirs``: extra projects granted via --add-dir, e.g. the
+    EMM+MFF Shopify pair) lists EVERY project's memory dir so the session checks
+    and maintains all of them."""
     if not project_dir:
         return ""
-    mem = f"/home/appuser/.claude/projects/{project_dir.replace('/', '-')}/memory"
+    mems = [
+        f"/home/appuser/.claude/projects/{d.replace('/', '-')}/memory"
+        for d in [project_dir, *(add_dirs or [])]
+    ]
+    mem = mems[0]
+    listing = "; ".join(f"`{m}/`" for m in mems)
+    multi = (
+        f" This channel spans {len(mems)} projects — check EACH memory store: {listing}."
+        if len(mems) > 1 else ""
+    )
     return (
         f" SHARED MEMORY — this project has a persistent, file-based memory at "
         f"`{mem}/`, SHARED with Alpha's terminal Claude (you both read AND write "
-        f"the same store). BEFORE assuming you don't know this project, read "
-        f"`{mem}/MEMORY.md` if it exists (a one-line index of saved facts) and open "
+        f"the same store).{multi} BEFORE assuming you don't know this project, read "
+        f"each store's `MEMORY.md` if it exists (a one-line index of saved facts) and open "
         f"any listed file relevant to the request. When you learn a durable, "
         f"reusable fact (how something works, a decision, a gotcha — not a one-off), "
-        f"SAVE it: write `{mem}/<short-slug>.md` with YAML frontmatter (name, "
+        f"SAVE it: write `<memory-dir>/<short-slug>.md` with YAML frontmatter (name, "
         f"description, metadata.type: project|feedback|reference) then the fact, and "
-        f"add a one-line pointer in `{mem}/MEMORY.md`. Update/dedupe rather than "
+        f"add a one-line pointer in that store's `MEMORY.md` (file it under the project "
+        f"the fact belongs to). Update/dedupe rather than "
         f"duplicate. This is how continuity persists across sessions and between "
         f"Slack and the terminal — check it early, keep it current."
     )
@@ -325,19 +339,21 @@ class ClaudeHandler:
     # per-project conversation, so these are thin wrappers over handle_turn.
     async def handle_message(
         self, channel: str, message_ts: str, text: str, reporter: Any = None,
-        files: list | None = None,
+        files: list | None = None, context: str | None = None,
     ) -> str:
-        return await self.handle_turn(channel, message_ts, text, reporter, files=files)
+        return await self.handle_turn(channel, message_ts, text, reporter,
+                                      files=files, context=context)
 
     async def handle_thread_reply(
         self, channel: str, thread_ts: str, text: str, reporter: Any = None,
-        files: list | None = None,
+        files: list | None = None, context: str | None = None,
     ) -> str:
-        return await self.handle_turn(channel, thread_ts, text, reporter, files=files)
+        return await self.handle_turn(channel, thread_ts, text, reporter,
+                                      files=files, context=context)
 
     async def handle_turn(
         self, channel: str, thread_ts: str, text: str, reporter: Any = None,
-        files: list | None = None,
+        files: list | None = None, context: str | None = None,
     ) -> str:
         """Run one turn, resuming the project's continuous Claude session.
 
@@ -355,7 +371,16 @@ class ClaudeHandler:
 
         label, text = _parse_worktree_tag(text)
         project_dir, plugin_dir = self._get_project_config(channel, label)
+        cfg = self.channel_cfg(channel)
+        # Extra project dirs this channel may touch (--add-dir), e.g. the EMM+MFF pair.
+        add_dirs: list[str] = [d for d in (cfg.get("add_dirs") or []) if d]
+        # A named sub-session ("session" key) keeps its own conversation within a
+        # shared project dir — e.g. phicampaign's desks: several channels, one repo,
+        # separate sessions. Without it, two channels on one dir would collide.
+        session_label = cfg.get("session")
         cwd_key = project_dir or f"chan:{channel}"
+        if session_label:
+            cwd_key = f"{cwd_key}#{session_label}"
 
         if force_new and not text:
             self._session.pop(cwd_key, None)
@@ -368,8 +393,10 @@ class ClaudeHandler:
         system_prompt = (
             self._FLOW_B_SYSTEM_PROMPT
             + _anchor_addendum(channel, thread_ts)
-            + _memory_addendum(project_dir)
+            + _memory_addendum(project_dir, add_dirs)
         )
+        if cfg.get("system_note"):
+            system_prompt += " " + str(cfg["system_note"])
 
         # Image/file attachments → download to a container-local dir and tell claude -p
         # to Read them (it has the Read tool + full access in the project cwd).
@@ -390,6 +417,14 @@ class ClaudeHandler:
                 )
         if attach_note:
             prompt = prompt + attach_note
+        # Surrounding Slack conversation (thread/channel history the bot was not
+        # invoked on) — fetched by the daemon so the turn sees what the humans see.
+        if context:
+            prompt = (
+                "## Recent Slack conversation (context — other participants' messages "
+                "you were not invoked on; the current request follows)\n"
+                f"{context}\n\n---\n\n{prompt}"
+            )
         logger.info("%s session %s for %s%s (thread %s) via %s engine",
                     "Resuming" if resume else "New", session_id, cwd_key,
                     " (/new)" if force_new else "", thread_ts, CLAUDE_RUNTIME)
@@ -401,12 +436,14 @@ class ClaudeHandler:
                     prompt, project_dir, system_prompt, reporter,
                     session_id=(None if resume else session_id),
                     resume=(session_id if resume else None),
+                    add_dirs=add_dirs,
                 )
             else:
                 cmd = self._build_cmd(
                     session_id=(None if resume else session_id),
                     resume=(session_id if resume else None),
                     plugin_dir=plugin_dir, system_prompt=system_prompt,
+                    add_dirs=add_dirs,
                 )
                 result = await self._run_claude(cmd, prompt, cwd=project_dir, reporter=reporter)
         _append_journal(cwd_key, text, result)
@@ -420,12 +457,37 @@ class ClaudeHandler:
             return cfg.get("mode", self._default_mode).lower()
         return self._default_mode
 
+    def channel_cfg(self, channel_id: str) -> dict:
+        """The channel's full projects.json config dict ({} when unmapped)."""
+        cfg = self._channel_id_to_project.get(channel_id) or self._project_map.get(channel_id)
+        return cfg if isinstance(cfg, dict) else {}
+
     def brain(self) -> Any:
-        """Lazily construct the BrainExecutor (only when a brain-mode channel is hit)."""
+        """Lazily construct the default BrainExecutor (only when a brain-mode channel
+        is hit). Kept for the classic single-brain deployment (DEFAULT_MODE=brain)."""
         if self._brain is None:
             from brain_executor import BrainExecutor
             self._brain = BrainExecutor(self._slack_client, team_id=self._team_id)
         return self._brain
+
+    def brain_for(self, channel_id: str) -> Any:
+        """The BrainExecutor for *channel_id*: a per-channel brain when the mapping
+        sets ``brain_dir`` (e.g. the metrics-desk), else the default brain. Instances
+        are cached per brain_dir so all channels of one brain share a queue."""
+        cfg = self.channel_cfg(channel_id)
+        brain_dir = cfg.get("brain_dir")
+        if not brain_dir:
+            return self.brain()
+        if not hasattr(self, "_brains"):
+            self._brains: dict[str, Any] = {}
+        if brain_dir not in self._brains:
+            from brain_executor import BrainExecutor
+            self._brains[brain_dir] = BrainExecutor(
+                self._slack_client, team_id=self._team_id,
+                brain_dir=brain_dir, name=cfg.get("brain_name"),
+                reply_timeout=cfg.get("brain_reply_timeout"),
+            )
+        return self._brains[brain_dir]
 
     def _lock_for(self, cwd_key: str) -> asyncio.Lock:
         lock = self._cwd_locks.get(cwd_key)
@@ -508,15 +570,17 @@ class ClaudeHandler:
                 name_to_id[ch["id"]] = ch["id"]  # allow raw IDs in config
 
             for channel_key, value in self._project_map.items():
-                # Normalise the legacy string format and the dict format.
+                # Normalise the legacy string format and the dict format. Dict entries
+                # keep ALL their keys (mode, add_dirs, session, brain_dir, brain_name,
+                # brain_reply_timeout, system_note, …) — earlier this rebuilt the dict
+                # from a whitelist, silently dropping "mode": "brain" for raw-ID keys.
                 if isinstance(value, str):
                     config = {"path": value, "plugin_dir": None, "worktrees": {}}
                 else:
-                    config = {
-                        "path": value.get("path"),
-                        "plugin_dir": value.get("plugin_dir"),
-                        "worktrees": value.get("worktrees") or {},
-                    }
+                    config = dict(value)
+                    config.setdefault("path", None)
+                    config.setdefault("plugin_dir", None)
+                    config.setdefault("worktrees", {})
 
                 # DM channel IDs (D...) and raw channel IDs (C...) are not
                 # returned by conversations_list — register them directly.
@@ -577,6 +641,7 @@ class ClaudeHandler:
         resume: str | None = None,
         plugin_dir: str | None = None,
         system_prompt: str | None = None,
+        add_dirs: list[str] | None = None,
     ) -> list[str]:
         # stream-json + --verbose makes the CLI emit one event per line on
         # stdout (system/init, assistant text, thinking, tool_use,
@@ -591,6 +656,9 @@ class ClaudeHandler:
         ]
         if plugin_dir:
             cmd.extend(["--plugin-dir", plugin_dir])
+        for d in add_dirs or []:
+            # Joint channels: extra project dirs the session may access (EMM+MFF).
+            cmd.extend(["--add-dir", d])
         if session_id:
             cmd.extend(["--session-id", session_id])
         if resume:
@@ -600,6 +668,7 @@ class ClaudeHandler:
     async def _run_sdk(
         self, prompt: str, cwd: str | None, system_prompt: str, reporter: Any = None,
         session_id: str | None = None, resume: str | None = None,
+        add_dirs: list[str] | None = None,
     ) -> str:
         """Run one turn via the Claude Agent SDK (in-process, typed messages).
 
@@ -619,6 +688,8 @@ class ClaudeHandler:
             system_prompt={"type": "preset", "preset": "claude_code", "append": system_prompt},
             env=env,
         )
+        if add_dirs:
+            options.add_dirs = add_dirs
         if resume:
             options.resume = resume
         elif session_id:

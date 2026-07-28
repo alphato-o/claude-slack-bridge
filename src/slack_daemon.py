@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -63,6 +64,7 @@ class SlackDaemon:
         self._seen_ts: dict[str, float] = {}           # event ts → seen-at (dedupe双-fire)
         self._bot_threads: set[str] = set()            # threads the bot belongs to (engage)
         self._non_bot_threads: set[str] = set()        # human-only threads (ignore) — cached
+        self._name_cache: dict[str, str] = {}          # user id → display name (context lines)
         self._bot_user_id: str = ""
 
         self._access_control = AccessControl(SecurityConfig.from_env())
@@ -154,6 +156,14 @@ class SlackDaemon:
         # into colleagues' conversations it was never tagged in).
         if thread_ts:
             if not mentioned:
+                # A reply that explicitly @-mentions SOMEONE ELSE (a colleague, another
+                # bot like Dario) is addressed to them, not us — never auto-continue on
+                # it, even in a 1:1 bot thread. (The metricsflare soup: "@Dario 在不在"
+                # in a Bran-rooted thread must not summon Bran.)
+                if not channel.startswith("D") and re.search(r"<@[A-Z0-9]+>", text):
+                    logger.info(
+                        "Reply in %s @-mentions someone else — staying out.", thread_ts)
+                    return
                 is_bot_thread = thread_ts in self._bot_threads
                 if not is_bot_thread:
                     if thread_ts in self._non_bot_threads:
@@ -163,11 +173,12 @@ class SlackDaemon:
                         logger.info("Ignoring reply in non-bot thread %s.", thread_ts)
                         return
                 # It IS a bot thread, but only auto-continue WITHOUT a mention while it
-                # stays 1:1 (the bot + a single human). Once a 2nd human joins, require an
-                # explicit @-mention so the bot does not chime into a group conversation.
-                if await self._thread_human_count(channel, thread_ts) > 1:
+                # stays strictly 1:1 (this bot + one human). A 2nd party of ANY kind
+                # (another human, or another bot such as Dario) → require an explicit
+                # @-mention so the bot does not chime into a group conversation.
+                if await self._thread_party_count(channel, thread_ts) > 1:
                     logger.info(
-                        "Multi-human thread %s without mention — awaiting explicit @.",
+                        "Multi-party thread %s without mention — awaiting explicit @.",
                         thread_ts)
                     return
             # Engaged (an @-mention, or a 1:1 bot thread). Remember it is a bot thread so
@@ -274,27 +285,92 @@ class SlackDaemon:
                 return True  # someone tagged the bot in this thread
         return False
 
-    async def _thread_human_count(self, channel: str, thread_ts: str) -> int:
-        """Count the DISTINCT human participants in a thread (the bot and any bot-authored
-        messages excluded). Used to gate no-mention auto-continue: engage without an
-        @-mention only while it is 1:1 (one human). On API failure we return a large number
-        so the caller stays quiet (require an explicit mention) rather than barging in."""
+    async def _thread_party_count(self, channel: str, thread_ts: str) -> int:
+        """Count the DISTINCT parties in a thread besides this bot: human participants
+        AND other bots/apps that have posted (e.g. Dario sharing a channel with Bran).
+        Used to gate no-mention auto-continue: engage without an @-mention only while
+        the thread is strictly 1:1 (this bot + exactly one other party, a human). More
+        than one party (a 2nd human OR any other bot) → require an explicit @-mention,
+        per the >2-parties rule: in a group conversation, address your bots explicitly.
+        On API failure we return a large number so the caller stays quiet (require an
+        explicit mention) rather than barging in."""
         try:
             resp = await self._app.client.conversations_replies(
                 channel=channel, ts=thread_ts, limit=200)
             messages = resp.get("messages", []) or []
         except Exception as exc:
             logger.warning(
-                "human-count fetch failed for %s (%s) — treating as multi-human.",
+                "party-count fetch failed for %s (%s) — treating as multi-party.",
                 thread_ts, exc)
             return 99
         humans: set[str] = set()
+        other_bots: set[str] = set()
         for m in messages:
             uid = m.get("user")
-            if not uid or uid == self._bot_user_id or m.get("bot_id"):
-                continue  # skip the bot itself and any bot-authored messages
-            humans.add(uid)
-        return len(humans)
+            if uid == self._bot_user_id:
+                continue  # this bot itself
+            bot_id = m.get("bot_id")
+            if bot_id:
+                other_bots.add(bot_id)  # a DIFFERENT bot is in this thread
+            elif uid:
+                humans.add(uid)
+        return len(humans) + len(other_bots)
+
+    async def _display_name(self, user_id: str) -> str:
+        """Resolve a user id to a display name, cached (best-effort; id on failure)."""
+        if user_id in self._name_cache:
+            return self._name_cache[user_id]
+        name = user_id
+        try:
+            info = await self._app.client.users_info(user=user_id)
+            u = info.get("user", {})
+            name = u.get("real_name") or u.get("name") or user_id
+        except Exception:
+            pass
+        self._name_cache[user_id] = name
+        return name
+
+    async def _slack_context(
+        self, channel: str, thread_ts: str, exclude_ts: str, is_new: bool,
+    ) -> str | None:
+        """The surrounding Slack conversation for one session-mode turn: the thread's
+        prior messages (a reply), or the channel's recent messages (a fresh top-level
+        mention). This is what fixes 'look at the messages above' — humans converse
+        between invocations and expect the bot to have seen it, but a claude turn only
+        receives the invoking message. Skipped for brain mode (the desk observes its
+        channel through its own tooling). Best-effort: None on failure or nothing new."""
+        try:
+            if is_new:
+                resp = await self._app.client.conversations_history(channel=channel, limit=12)
+                msgs = list(reversed(resp.get("messages", []) or []))
+            else:
+                resp = await self._app.client.conversations_replies(
+                    channel=channel, ts=thread_ts, limit=40)
+                msgs = resp.get("messages", []) or []
+        except Exception as exc:
+            logger.debug("context fetch failed for %s: %s", thread_ts, exc)
+            return None
+        lines: list[str] = []
+        for m in msgs:
+            ts = m.get("ts", "")
+            if ts == exclude_ts or m.get("subtype") == "channel_join":
+                continue
+            text = " ".join((m.get("text") or "").split())
+            if not text:
+                continue
+            uid = m.get("user", "")
+            if uid == self._bot_user_id:
+                who = "you (the bot)"
+            elif m.get("bot_id") and not uid:
+                who = f"[bot {m.get('bot_id')}]"
+            else:
+                who = await self._display_name(uid) if uid else "?"
+            if len(text) > 400:
+                text = text[:399] + "…"
+            lines.append(f"- {who}: {text}")
+        if not lines:
+            return None
+        return "\n".join(lines[-30:])[-4000:]
 
     def _make_reporter(
         self, channel: str, thread_ts: str, user_id: str, user_team: str = ""
@@ -334,7 +410,7 @@ class SlackDaemon:
                     user_name = u.get("real_name") or u.get("name", "")
                 except Exception:
                     pass
-                reply = await self._claude.brain().handle_turn(
+                reply = await self._claude.brain_for(channel).handle_turn(
                     channel, thread_ts, text,
                     user=user_id, user_name=user_name,
                     is_dm=channel.startswith("D"), mentioned=True,
@@ -373,8 +449,10 @@ class SlackDaemon:
         self._run_tasks[thread_ts] = asyncio.current_task()  # type: ignore[assignment]
         reporter = self._make_reporter(channel, thread_ts, user_id, user_team)
         try:
+            context = await self._slack_context(channel, thread_ts, msg_ts, is_new)
             await reporter.start()
-            response = await self._claude.handle_turn(channel, thread_ts, text, reporter, files=files)
+            response = await self._claude.handle_turn(
+                channel, thread_ts, text, reporter, files=files, context=context)
             await reporter.finish(response)
         except asyncio.CancelledError:
             # Intentional hard interrupt — finalize the stream, don't treat as error.

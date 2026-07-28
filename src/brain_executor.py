@@ -54,15 +54,27 @@ def _chunks(text: str):
 
 
 class BrainExecutor:
-    """Routes a Slack turn to the single standing Dario brain via a host inbox/outbox."""
+    """Routes a Slack turn to a standing brain session via a host inbox/outbox.
 
-    def __init__(self, slack_client: Any, team_id: str = "") -> None:
+    One instance per brain: the classic single-brain deployment (Dario on Arya,
+    DEFAULT_MODE=brain, dir from BRAIN_DIR) and per-channel brains (a projects.json
+    entry with ``"mode": "brain"`` plus ``"brain_dir"``/``"brain_name"``, e.g. the
+    phicampaign metrics-desk) both go through here — same contract, different dir."""
+
+    def __init__(
+        self, slack_client: Any, team_id: str = "",
+        brain_dir: str | None = None, name: str | None = None,
+        reply_timeout: int | None = None,
+    ) -> None:
         self._client = slack_client
         self._team_id = team_id or os.getenv("SLACK_TEAM_ID", "")
-        (BRAIN_DIR / "inbox").mkdir(parents=True, exist_ok=True)
-        (BRAIN_DIR / "outbox").mkdir(parents=True, exist_ok=True)
-
-    THINKING = "🧠 _Dario is thinking…_"
+        self._dir = Path(brain_dir) if brain_dir else BRAIN_DIR
+        self._name = name or os.getenv("BRAIN_NAME", "Dario")
+        self._timeout = reply_timeout or REPLY_TIMEOUT
+        self._thinking_md = f"🧠 _{self._name} is thinking…_"
+        self._thinking_status = f"🧠 {self._name} is thinking…"
+        (self._dir / "inbox").mkdir(parents=True, exist_ok=True)
+        (self._dir / "outbox").mkdir(parents=True, exist_ok=True)
 
     async def handle_turn(
         self, channel: str, thread_ts: str, text: str, *,
@@ -84,13 +96,13 @@ class BrainExecutor:
         #     reply. This is the actual title-shimmer (separate from text streaming).
         #     If setStatus is unavailable, fall back to a static "🧠 thinking…" placeholder.
         placeholder_ts = shimmer = None
-        status_ok = await self._set_status(channel, anchor_ts, "🧠 Dario is thinking…")
+        status_ok = await self._set_status(channel, anchor_ts, self._thinking_status)
         if status_ok:
             shimmer = asyncio.ensure_future(self._shimmer(channel, anchor_ts))
         else:
             try:
                 r = await self._client.chat_postMessage(
-                    channel=channel, thread_ts=anchor_ts, text=self.THINKING)
+                    channel=channel, thread_ts=anchor_ts, text=self._thinking_md)
                 placeholder_ts = r.get("ts")
             except Exception as exc:
                 logger.debug("placeholder post failed: %s", exc)
@@ -98,7 +110,7 @@ class BrainExecutor:
         # 1b) download any image/file attachments into the bind-mounted brain dir so the
         #     native brain can Read them (Slack url_private needs the bot token).
         attachments = slack_files.download(
-            files or [], BRAIN_DIR / "inbox" / f"{evt_id}_files", BOT_TOKEN)
+            files or [], self._dir / "inbox" / f"{evt_id}_files", BOT_TOKEN)
 
         # 2) write the event to the host inbox (native brain reads it via slack_loop)
         event = {
@@ -107,15 +119,16 @@ class BrainExecutor:
             "is_dm": is_dm, "mentioned": mentioned, "text": text,
             "attachments": attachments, "placeholder_ts": placeholder_ts, "t": time.time(),
         }
-        inbox_f = BRAIN_DIR / "inbox" / f"{evt_id}.json"
+        inbox_f = self._dir / "inbox" / f"{evt_id}.json"
         tmp = inbox_f.with_suffix(".tmp")
         tmp.write_text(json.dumps(event, ensure_ascii=False))
         tmp.rename(inbox_f)                                   # atomic publish
-        logger.info("brain-mode: queued %s (chan %s, thread %s)", evt_id, channel, anchor_ts)
+        logger.info("brain-mode[%s]: queued %s (chan %s, thread %s)",
+                    self._name, evt_id, channel, anchor_ts)
 
         # 3) await the brain's reply file, then reveal the answer into the open stream
-        reply_f = BRAIN_DIR / "outbox" / f"{evt_id}.reply"
-        deadline = time.monotonic() + REPLY_TIMEOUT
+        reply_f = self._dir / "outbox" / f"{evt_id}.reply"
+        deadline = time.monotonic() + self._timeout
         out = None
         while time.monotonic() < deadline:
             if reply_f.exists():
@@ -159,7 +172,7 @@ class BrainExecutor:
             while True:
                 await asyncio.sleep(9)
                 await self._client.assistant_threads_setStatus(
-                    channel_id=channel, thread_ts=thread_ts, status="🧠 Dario is thinking…")
+                    channel_id=channel, thread_ts=thread_ts, status=self._thinking_status)
         except asyncio.CancelledError:
             return
         except Exception as exc:
