@@ -84,19 +84,24 @@ class BrainExecutor:
         evt_id = f"evt_{message_ts or thread_ts or time.time()}".replace(".", "_")
         anchor_ts = thread_ts or message_ts
 
-        # 1) instant ack — 👀 reaction on the source message (no brain round-trip)
+        # 1) instant ack — 👀 reaction on the source message (no brain round-trip).
+        #    WARNING on failure, not debug: a silent ack failure (e.g. the app missing
+        #    the reactions:write scope) looks like the bot ignored the user.
         if message_ts:
             try:
                 await self._client.reactions_add(channel=channel, timestamp=message_ts, name=ACK_EMOJI)
             except Exception as exc:
-                logger.debug("ack reaction failed: %s", exc)
+                logger.warning("ack reaction failed (missing reactions:write scope?): %s", exc)
 
-        # 1a) SHIMMER — assistant.threads.setStatus animates the "Dario" title in theme
-        #     colour ("is working"). Set it now, refresh it through the think, clear on
-        #     reply. This is the actual title-shimmer (separate from text streaming).
-        #     If setStatus is unavailable, fall back to a static "🧠 thinking…" placeholder.
+        # 1a) SHIMMER — assistant.threads.setStatus animates the app title ("is
+        #     working"). Only meaningful in DM/assistant surfaces: on a CHANNEL thread
+        #     the API returns ok:true but renders NOTHING (learned 2026-07-29 — 15
+        #     silent minutes on #bot-metricsflare), so channels always get the visible
+        #     "🧠 thinking…" placeholder instead.
         placeholder_ts = shimmer = None
-        status_ok = await self._set_status(channel, anchor_ts, self._thinking_status)
+        status_ok = False
+        if is_dm:
+            status_ok = await self._set_status(channel, anchor_ts, self._thinking_status)
         if status_ok:
             shimmer = asyncio.ensure_future(self._shimmer(channel, anchor_ts))
         else:
