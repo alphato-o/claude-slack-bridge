@@ -49,6 +49,11 @@ services:
       # metrics-desk brain handoff: #bot-metricsflare routes to phicampaign's LIVE
       # metrics-desk session via this inbox/outbox dir (see docs/metrics-desk-slack-handout.md).
       - ${PROJECTS_DIR}/phicampaign/desks/metrics-desk/slack:/brain/metrics-desk
+      # ai-arsenal brain handoff: #logitstic-ai-arsenal routes to the standing
+      # ai-arsenal session (broadcast-mostly channel; contract in ai-arsenal/slack/HANDOUT.md).
+      - ${PROJECTS_DIR}/ai-arsenal/slack:/brain/ai-arsenal
+      # ai-arsenal memory (standing rule: every onboarded project gets the mount).
+      - ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-ai-arsenal/memory:/home/appuser/.claude/projects/-projects-ai-arsenal/memory
     restart: unless-stopped
 
 volumes:
