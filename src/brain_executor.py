@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,26 @@ def _chunks(text: str):
             yield " ".join(buf) + " "; buf, n = [], 0
     if buf:
         yield " ".join(buf)
+
+
+_MD_BOLD  = re.compile(r"\*\*(?=\S)([^\n]+?)(?<=\S)\*\*")
+_MD_UBOLD = re.compile(r"__(?=\S)([^\n]+?)(?<=\S)__")
+_MD_STRIKE = re.compile(r"~~(?=\S)([^\n]+?)(?<=\S)~~")
+
+def _md_to_mrkdwn(text: str) -> str:
+    """Convert standard Markdown to Slack mrkdwn for the NON-streaming reveal path.
+
+    The brain writes outbox replies in Markdown because the streaming path sends them as
+    ``markdown_text``. This fallback posts them as ``text=``, which Slack parses as *mrkdwn*,
+    where ``*x*`` is bold and ``**x**`` is literal asterisks. Without this, the same reply
+    rendered bold when streaming worked and italic (or raw ``**``) when it did not, decided at
+    runtime by whether chat.startStream happened to succeed. Observed 2026-07-30: a 3.5k reply
+    landed with 20 italic spans and zero bold. Keep in sync with to_markdown() in slack_say.py.
+    """
+    out = _MD_BOLD.sub(r"*\1*", text or "")
+    out = _MD_UBOLD.sub(r"*\1*", out)
+    out = _MD_STRIKE.sub(r"~\1~", out)
+    return out
 
 
 class BrainExecutor:
@@ -205,12 +226,12 @@ class BrainExecutor:
         if not streamed:
             if placeholder_ts:
                 try:
-                    await self._client.chat_update(channel=channel, ts=placeholder_ts, text=out)
+                    await self._client.chat_update(channel=channel, ts=placeholder_ts, text=_md_to_mrkdwn(out))
                 except Exception as exc:
                     logger.debug("placeholder update failed (%s) — posting fresh", exc)
-                    await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=out)
+                    await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=_md_to_mrkdwn(out))
             else:
-                await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=out)
+                await self._client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=_md_to_mrkdwn(out))
         if message_ts:
             await self._done_react(channel, message_ts)
 
