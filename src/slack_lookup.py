@@ -80,14 +80,55 @@ def by_name(needle: str, max_pages: int = 10) -> int:
     return 0 if found else 1
 
 
+def in_channel(channel: str, needle: str = "") -> int:
+    """List/search the MEMBERS of a channel — including Slack-Connect EXTERNAL
+    people, whom --email/--name cannot see. This is the safe way to find the id
+    to @-mention in that channel (a member is mentionable by construction, and
+    deleted ghost ids never appear here)."""
+    needle_l = (needle or "").lower()
+    cursor, found = "", 0
+    while True:
+        kw = {"channel": channel, "limit": 200}
+        if cursor:
+            kw["cursor"] = cursor
+        r = _api("conversations.members", **kw)
+        if not r.get("ok"):
+            print(f"conversations.members failed: {r.get('error')}", file=sys.stderr)
+            return 1
+        for uid in r.get("members", []):
+            try:
+                u = _api("users.info", user=uid)["user"]
+            except Exception:
+                continue
+            if u.get("is_bot") or u.get("deleted"):
+                continue
+            p = u.get("profile", {})
+            hay = " ".join(filter(None, [
+                u.get("name"), u.get("real_name"), p.get("real_name"),
+                p.get("display_name"), p.get("email")])).lower()
+            if not needle_l or needle_l in hay:
+                print(_row(u))
+                found += 1
+        cursor = r.get("response_metadata", {}).get("next_cursor", "")
+        if not cursor:
+            break
+    if not found:
+        print("no matching member in that channel", file=sys.stderr)
+    return 0 if found else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--email", help="exact email lookup (own workspace only)")
     ap.add_argument("--name", help="case-insensitive substring over member names")
+    ap.add_argument("--channel", help="search MEMBERS of this channel (finds "
+                    "Slack-Connect external people; combine with --name to filter)")
     args = ap.parse_args()
     if not TOKEN:
         print("SLACK_BOT_TOKEN not set", file=sys.stderr)
         return 1
+    if args.channel:
+        return in_channel(args.channel, args.name or "")
     if args.email:
         return by_email(args.email)
     if args.name:
