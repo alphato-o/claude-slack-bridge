@@ -71,7 +71,28 @@ def _md_to_mrkdwn(text: str) -> str:
     out = _MD_BOLD.sub(r"*\1*", text or "")
     out = _MD_UBOLD.sub(r"*\1*", out)
     out = _MD_STRIKE.sub(r"~\1~", out)
-    return out
+    return _space_mrkdwn(out)
+
+
+# Slack renders *bold* only when the marker touches ASCII whitespace or a line edge. Converting the
+# dialect is NOT enough: `建好了：*PHI-1283*，due` has the markers against fullwidth CJK punctuation,
+# so it renders as literal asterisks. Caught 2026-07-31, a reply that had already survived two earlier
+# fixes still landed with zero bold. Excludes ASCII word chars only, spelled out, because Python's
+# \w matches CJK and would skip exactly the spans that need the space.
+_MRK_RE = re.compile(r"(?<![*~_A-Za-z0-9])([*~_])(?!\s)([^\n]+?)(?<!\s)\1(?![*~_A-Za-z0-9])")
+
+
+def _space_mrkdwn(text: str) -> str:
+    out = []
+    for line in (text or "").split("\n"):
+        def repl(m, _line=line):
+            before = _line[m.start() - 1] if m.start() > 0 else ""
+            after = _line[m.end()] if m.end() < len(_line) else ""
+            lead = "" if (before == "" or before.isspace()) else " "
+            tail = "" if (after == "" or after.isspace()) else " "
+            return f"{lead}{m.group(1)}{m.group(2)}{m.group(1)}{tail}"
+        out.append(_MRK_RE.sub(repl, line))
+    return "\n".join(out)
 
 
 class BrainExecutor:
