@@ -15,15 +15,15 @@ Slack renders real markdown, with no @channel ping.
 
 Delivery guarantees (added 2026-07-31 after two silent failures):
 
+- Any mention or DM target that is a DELETED account (a stale directory ghost)
+  is REFUSED (exit 4) — sends to it "succeed" but no human can ever see them.
 - Every ``<@U…>`` mention in the text is validated against the TARGET CHANNEL's
   member list. Mentioning a non-member notifies NOBODY (and renders as dead
-  text for Connect-external users), so that post is REFUSED (exit 4) with the
+  text for cross-workspace viewers), so that post is REFUSED (exit 4) with the
   working options listed. Override with --force.
-- A DM target (``--channel U…`` or ``--channel D…``) is checked for the
-  external-workspace trap: an app-initiated Slack-Connect DM to a user from
-  another org who has never messaged this bot lands in acceptance limbo (the
-  recipient sees nothing, the API reports success). That send is REFUSED
-  (exit 4) unless the DM already has messages FROM the user, or --force.
+- Cross-workspace DMs (FydeOS bot → Phinomenon colleague) WORK, first contact
+  included (verified live 2026-07-31), and are NOT blocked — one org, two
+  workspaces. Just resolve a LIVE id first (slack_lookup.py --channel).
 
 Exit codes: 0 ok, 1 empty message, 2 no token, 3 Slack API error, 4 refused.
 """
@@ -82,8 +82,6 @@ def main() -> int:
     mentions = set(re.findall(r"<@(U[A-Z0-9]+)>", text))
 
     try:
-        my_team = client.auth_test().get("team_id", "")
-
         # --- refuse DELETED users anywhere (mention or DM target) ----------------
         # The trap that burned us on 2026-07-31: a stale directory pointed at
         # DELETED ghost accounts (old guest users), so correct-looking sends went
@@ -105,32 +103,13 @@ def main() -> int:
                           file=sys.stderr)
                     return 4
 
-        # --- DM path: user id, or D channel -------------------------------------
-        dm_target = channel if channel.startswith("U") else ""
+        # --- DM path: a user id opens (or reuses) the DM channel ------------------
+        # Cross-workspace DMs to Phinomenon colleagues WORK (verified live
+        # 2026-07-31: first-contact DM to Lex, receipt confirmed by reaction) —
+        # the company runs one org across two Slack workspaces. The killer to
+        # guard against is DELETED ghost ids (checked above), not workspace lines.
         if channel.startswith("U"):
             channel = client.conversations_open(users=channel)["channel"]["id"]
-        if channel.startswith("D") and not args.force:
-            hist = client.conversations_history(channel=channel, limit=20)
-            other = dm_target or next(
-                (m.get("user") for m in hist.get("messages", [])
-                 if m.get("user") and not m.get("bot_id")), "")
-            them_spoke = any(m.get("user") == other for m in hist.get("messages", []))
-            external = False
-            if other:
-                try:
-                    external = client.users_info(user=other)["user"].get("team_id", my_team) != my_team
-                except Exception:
-                    external = True  # can't verify → treat as external
-            if external and not them_spoke:
-                print(
-                    "slack_notify: REFUSED — this DM targets an EXTERNAL-workspace user "
-                    f"({_who(client, other)}) who has never messaged this bot. App-initiated "
-                    "Slack-Connect DMs to such users land in acceptance limbo: the API reports "
-                    "success but the person sees NOTHING. Working options: (1) reach them on "
-                    "Feishu (lark-cli, the Dario identity), (2) @-mention them in a shared "
-                    "channel they are a member of, (3) ask Alpha to DM them, (4) --force if you "
-                    "truly accept the limbo risk.", file=sys.stderr)
-                return 4
 
         # --- channel path: validate mentions against membership ------------------
         if channel.startswith(("C", "G")) and mentions and not args.force:
