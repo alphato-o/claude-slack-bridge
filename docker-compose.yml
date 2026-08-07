@@ -54,6 +54,11 @@ services:
       - ${PROJECTS_DIR}/ai-arsenal/slack:/brain/ai-arsenal
       # ai-arsenal memory (standing rule: every onboarded project gets the mount).
       - ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-ai-arsenal/memory:/home/appuser/.claude/projects/-projects-ai-arsenal/memory
+      # phi-i18n brain handoff: #withclaude-browseri18n routes to the standing
+      # phi-i18n session (contract in phi-i18n/slack/HANDOUT.md).
+      - ${PROJECTS_DIR}/phi-i18n/slack:/brain/phi-i18n
+      # phi-i18n memory (standing rule: every onboarded project gets the mount).
+      - ${HOME}/.claude/projects/-Users-fydeos-Dev-ccplayground-phi-i18n/memory:/home/appuser/.claude/projects/-projects-phi-i18n/memory
     restart: unless-stopped
 
 volumes:
