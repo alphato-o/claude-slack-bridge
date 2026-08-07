@@ -41,6 +41,23 @@ HOTLINE_BOT_CHANNELS = {c for c in os.environ.get("HOTLINE_BOT_CHANNELS", "C0BCJ
 HOTLINE_BOT_IDS = {b for b in os.environ.get("HOTLINE_BOT_IDS", "B0BCC9KTTRS").split(",") if b}
 
 
+
+def _label_by_speaker(queued: list[tuple[str, str]]) -> str:
+    """Render queued messages so each one names its author.
+
+    A drained batch can hold messages from SEVERAL people. Collapsing them into
+    one blob loses who said what, which makes the brain thank the wrong person
+    and address the wrong person as "you". When more than one author is present
+    every message gets an explicit ``<@U…>`` prefix; a single-author batch is
+    left clean so the common case reads naturally.
+    """
+    if not queued:
+        return ""
+    authors = {u for u, _ in queued if u}
+    if len(authors) <= 1:
+        return "\n\n".join(t for _, t in queued)
+    return "\n\n".join(f"<@{u}> said:\n{t}" if u else t for u, t in queued)
+
 class SlackDaemon:
     """
     Bridges Slack Socket Mode events to waiting session processes via a
@@ -60,7 +77,12 @@ class SlackDaemon:
         self._claude = ClaudeHandler(slack_client=self._app.client)
         self._active_threads: set[str] = set()
         self._run_tasks: dict[str, asyncio.Task] = {}  # thread_ts → in-flight run task
-        self._queued: dict[str, list[str]] = {}        # thread_ts → messages to apply next turn
+        # thread_ts → [(user_id, text)]. BUGFIX 2026-08-07: this used to be a
+        # bare list[str]. Two people writing into one thread while a run was in
+        # flight got their messages concatenated and stamped with the IN-FLIGHT
+        # message's author, so the brain credited both to the wrong person and
+        # answered one of them with "you" meaning someone else. Keep the author.
+        self._queued: dict[str, list[tuple[str, str]]] = {}
         self._seen_ts: dict[str, float] = {}           # event ts → seen-at (dedupe双-fire)
         self._bot_threads: set[str] = set()            # threads the bot belongs to (engage)
         self._non_bot_threads: set[str] = set()        # human-only threads (ignore) — cached
@@ -436,7 +458,8 @@ class SlackDaemon:
                 # and reusing thread_ts would collide with the done-ledger).
                 queued = self._queued.pop(thread_ts, None)
                 if queued:
-                    combined = "\n\n".join(queued)
+                    combined = _label_by_speaker(queued)
+                    user_id = queued[0][0]  # attribute to the first queued speaker, not the finished run
                     logger.info("Draining %d queued msg(s) on %s as the next brain turn.",
                                 len(queued), thread_ts)
                     self._active_threads.add(thread_ts)  # claim before the await gap
@@ -473,7 +496,8 @@ class SlackDaemon:
                 self._run_tasks.pop(thread_ts, None)
             queued = self._queued.pop(thread_ts, None)
             if queued:
-                combined = "\n\n".join(queued)
+                combined = _label_by_speaker(queued)
+                user_id = queued[0][0]  # attribute to the first queued speaker, not the finished run
                 logger.info("Draining %d queued msg(s) on %s as the next turn.", len(queued), thread_ts)
                 self._active_threads.add(thread_ts)  # claim before the await gap
                 asyncio.create_task(self._run_turn(
@@ -487,7 +511,7 @@ class SlackDaemon:
         if kind == "hard":
             logger.info("Hard interrupt on %s (remainder=%r).", thread_ts, remainder[:80])
             if remainder:
-                self._queued.setdefault(thread_ts, []).append(remainder)
+                self._queued.setdefault(thread_ts, []).append((user_id, remainder))
             note = "⏹️ _Stopping the current run…_"
             if remainder:
                 note += " I'll run your new instruction next."
@@ -497,7 +521,7 @@ class SlackDaemon:
                 task.cancel()  # its finally drains the queue → starts the new turn
             return
         # Soft: queue for the next turn (matches typing while the CLI is working).
-        self._queued.setdefault(thread_ts, []).append(text)
+        self._queued.setdefault(thread_ts, []).append((user_id, text))
         logger.info("Soft-queued on busy %s: %r", thread_ts, text[:80])
         await self._post(
             channel, thread_ts,
