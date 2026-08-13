@@ -138,13 +138,13 @@ class ActivityRenderer:
                             if isinstance(t, dict) and t.get("status") == "in_progress"), "")
             done = sum(1 for t in todos if isinstance(t, dict) and t.get("status") == "completed")
             head = f"{emoji} Plan: {len(todos)} steps ({done} done)"
-            return f"{head} — now: {_first_line(current, 80)}" if current else head
+            return f"{head}, now: {_first_line(current, 80)}" if current else head
         if key == "taskcreate":
             return f"{emoji} Plan: {_first_line(ti.get('subject', 'task'), 80)}"
         if key == "taskupdate":
             status = (ti.get("status") or "").replace("_", " ")
             label = ti.get("subject") or f"task {ti.get('taskId', '')}"
-            return f"{emoji} {_first_line(label, 70)}" + (f" — {status}" if status else "")
+            return f"{emoji} {_first_line(label, 70)}" + (f": {status}" if status else "")
         if key.startswith("mcp__"):
             pretty = key.split("__", 2)[-1].replace("_", " ")
             return f"{emoji} {pretty}"

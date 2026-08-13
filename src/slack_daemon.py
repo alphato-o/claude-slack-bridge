@@ -250,7 +250,7 @@ class SlackDaemon:
         try:
             await self._app.client.chat_postMessage(
                 channel=channel,
-                text=("👋 Dario here. @mention me in this channel and I'll pick it up — "
+                text=("👋 Dario here. @mention me in this channel and I'll pick it up: "
                       "I reply in a thread under your mention. (Casual chatter I stay out of.)"),
             )
         except Exception as exc:
@@ -525,7 +525,7 @@ class SlackDaemon:
         logger.info("Soft-queued on busy %s: %r", thread_ts, text[:80])
         await self._post(
             channel, thread_ts,
-            "📨 _Got it — I'll fold this into the next turn (I'm mid-task). "
+            "📨 _Got it, I'll fold this into the next turn (I'm mid-task). "
             "Send `!` (or `停`/`stop`) first to interrupt now instead._",
         )
 

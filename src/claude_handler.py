@@ -736,7 +736,7 @@ class ClaudeHandler:
                 mins = IDLE_TIMEOUT // 60 if reason == "idle" else MAX_RUNTIME // 60
                 why = (f"went quiet for {mins} min (looked stuck)" if reason == "idle"
                        else f"hit the {mins // 60} h max-runtime cap")
-                return f"_(I stopped — the run {why}. Reply in this thread to continue where I left off.)_"
+                return f"_(I stopped, the run {why}. Reply in this thread to continue where I left off.)_"
             await work  # surface exceptions
             if final_result is None:
                 logger.warning("SDK run ended with no result message.")
@@ -863,7 +863,7 @@ class ClaudeHandler:
                 mins = IDLE_TIMEOUT // 60 if reason == "idle" else MAX_RUNTIME // 60
                 why = (f"went quiet for {mins} min (looked stuck)" if reason == "idle"
                        else f"hit the {mins // 60} h max-runtime cap")
-                return f"_(I stopped — the run {why}. Reply in this thread to continue where I left off.)_"
+                return f"_(I stopped, the run {why}. Reply in this thread to continue where I left off.)_"
 
             await work  # surface any consumer/process exception
 

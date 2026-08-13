@@ -187,7 +187,7 @@ class BrainExecutor:
             await asyncio.sleep(POLL)
         if out is None:
             logger.warning("brain-mode: timeout awaiting reply for %s", evt_id)
-            out = "⏳ Still working on this one — I'll follow up in this thread when it's done."
+            out = "⏳ Still working on this one, I'll follow up in this thread when it's done."
 
         if shimmer:
             shimmer.cancel()
