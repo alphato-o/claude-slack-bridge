@@ -107,6 +107,15 @@ class SlackDaemon:
                 and f"<@{self._bot_user_id}>" in (event.get("text") or "")
             )
             if not hotline:
+                # NEVER drop a mention of us silently: a sibling bot (e.g. Dario)
+                # @-ing this bot outside the allowlist was invisible in the logs,
+                # which cost two missed fleet consults on 2026-07-30.
+                if (f"<@{self._bot_user_id}>" in (event.get("text") or "")
+                        and event.get("user") != self._bot_user_id):
+                    logger.info(
+                        "Dropping bot-authored mention from bot_id=%s in %s — add it to "
+                        "HOTLINE_BOT_IDS + the channel to HOTLINE_BOT_CHANNELS to accept.",
+                        bot_id, event.get("channel"))
                 return
             logger.info("hotline: accepting bot mention from %s in %s", bot_id, event.get("channel"))
 
